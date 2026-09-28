@@ -89,7 +89,6 @@ impl RoomMessagesChannel {
     }
 }
 
-#[async_trait::async_trait]
 impl Channel<CableUser> for RoomMessagesChannel {
     async fn subscribed(&mut self, sub: &mut Subscription<CableUser>) -> ChannelResult {
         match self.authorized_stream_name(sub).await? {

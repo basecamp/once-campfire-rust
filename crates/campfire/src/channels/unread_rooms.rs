@@ -11,7 +11,6 @@ pub fn stream_name_for(user_id: i64) -> String {
     format!("user_{user_id}_unreads")
 }
 
-#[async_trait::async_trait]
 impl Channel<CableUser> for UnreadRoomsChannel {
     async fn subscribed(&mut self, sub: &mut Subscription<CableUser>) -> ChannelResult {
         let stream = stream_name_for(sub.current_user().id);

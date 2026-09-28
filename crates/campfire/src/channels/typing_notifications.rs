@@ -38,7 +38,6 @@ pub struct UserAttributes<'a> {
     pub name: &'a str,
 }
 
-#[async_trait::async_trait]
 impl Channel<CableUser> for TypingNotificationsChannel {
     async fn subscribed(&mut self, sub: &mut Subscription<CableUser>) -> ChannelResult {
         self.room = room::subscribe(&self.db, sub).await?;

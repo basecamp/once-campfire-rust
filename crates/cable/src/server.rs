@@ -11,7 +11,7 @@ use futures_util::future::BoxFuture;
 use serde::Serialize;
 use tokio::sync::{broadcast, watch};
 
-use crate::channel::Channel;
+use crate::channel::{Channel, DynChannel};
 use crate::pubsub::{Frame, Hub};
 use crate::socket::Handshake;
 use crate::{connection, json, naming, protocol};
@@ -79,7 +79,7 @@ pub trait Identified {
     fn connection_identifier(&self) -> String;
 }
 
-type ChannelFactory<U> = Arc<dyn Fn() -> Box<dyn Channel<U>> + Send + Sync>;
+type ChannelFactory<U> = Arc<dyn Fn() -> Box<dyn DynChannel<U>> + Send + Sync>;
 
 pub struct ServerBuilder<U: Send + Sync + 'static> {
     config: Config,
@@ -95,7 +95,7 @@ impl<U: Identified + Send + Sync + 'static> ServerBuilder<U> {
         C: Channel<U>,
         F: Fn() -> C + Send + Sync + 'static,
     {
-        self.channels.insert(class_name.to_string(), Arc::new(move || Box::new(factory()) as Box<dyn Channel<U>>));
+        self.channels.insert(class_name.to_string(), Arc::new(move || Box::new(factory()) as Box<dyn DynChannel<U>>));
         self
     }
 

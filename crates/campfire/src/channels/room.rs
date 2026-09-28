@@ -75,7 +75,6 @@ fn ruby_to_i(s: &str) -> Option<i64> {
     Some(if negative { -value } else { value })
 }
 
-#[async_trait::async_trait]
 impl Channel<CableUser> for RoomChannel {
     async fn subscribed(&mut self, sub: &mut Subscription<CableUser>) -> ChannelResult {
         self.room = subscribe(&self.db, sub).await?;

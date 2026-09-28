@@ -17,7 +17,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::channel::{Channel, Params, Subscription};
+use crate::channel::{DynChannel, Params, Subscription};
 use crate::protocol::{self, DisconnectReason};
 use crate::pubsub::{Deliveries, Frame, Subscriber};
 use crate::server::{ConnectRequest, Identified, internal_channel};
@@ -25,7 +25,7 @@ use crate::socket::{Incoming, Reader, Writer};
 use crate::{Server, json};
 
 struct Entry<U: Send + Sync + 'static> {
-    channel: Box<dyn Channel<U>>,
+    channel: Box<dyn DynChannel<U>>,
     sub: Subscription<U>,
 }
 
