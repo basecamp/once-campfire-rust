@@ -20,6 +20,7 @@ use std::time::Duration;
 use axum::body::Body;
 use axum::http::{HeaderValue, Request, Response, StatusCode, header};
 use bytes::Bytes;
+use futures_util::future::BoxFuture;
 use hyper::body::{Frame, Incoming, SizeHint};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder;
@@ -33,7 +34,7 @@ use super::handler::ConnInfo;
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 /// What serves the requests of a connection.
-pub type Service = Arc<dyn Fn(Request<Body>, ConnInfo) -> Pin<Box<dyn Future<Output = Response<Body>> + Send>> + Send + Sync>;
+pub type Service = Arc<dyn Fn(Request<Body>, ConnInfo) -> BoxFuture<'static, Response<Body>> + Send + Sync>;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Options {

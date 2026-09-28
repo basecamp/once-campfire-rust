@@ -5,7 +5,6 @@
 
 use std::future::Future;
 use std::net::SocketAddr;
-use std::pin::Pin;
 
 use axum::Router;
 use axum::body::{Body as AxumBody, Bytes};
@@ -16,6 +15,7 @@ use axum::http::{Method, StatusCode};
 use axum::middleware::Next;
 use axum::routing::MethodRouter;
 use futures_util::FutureExt;
+use futures_util::future::BoxFuture;
 
 use crate::app::Kit;
 use crate::body::{self, ParsedBody};
@@ -64,7 +64,7 @@ impl<F> Handler<ActionMarker, Kit> for ActionHandler<F>
 where
     F: for<'a> ActionFn<'a> + Clone,
 {
-    type Future = Pin<Box<dyn Future<Output = axum::response::Response> + Send>>;
+    type Future = BoxFuture<'static, axum::response::Response>;
 
     fn call(self, req: axum::extract::Request, kit: Kit) -> Self::Future {
         Box::pin(async move { dispatch(kit, req, self.0).await })
@@ -137,7 +137,7 @@ where
     let result = match failure {
         Some(error) => Err(error),
         None => {
-            let future: Pin<Box<dyn Future<Output = Result<Response>> + Send + '_>> = Box::pin(action.call(&mut ctx));
+            let future: BoxFuture<'_, Result<Response>> = Box::pin(action.call(&mut ctx));
             // A panicking action is an exception like any other: Rails' `ShowExceptions` answers
             // 500 with `public/500.html`, where an unwinding handler would drop the connection.
             std::panic::AssertUnwindSafe(future).catch_unwind().await.unwrap_or_else(|panic| Err(panic_error(panic)))
