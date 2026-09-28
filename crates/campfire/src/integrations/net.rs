@@ -6,15 +6,12 @@
 pub mod guard;
 pub mod http;
 
-use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 
+use futures_util::future::BoxFuture;
 use tokio::net::TcpStream;
-
-pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Name resolution. The system one is `getaddrinfo` (Ruby's `Resolv.getaddresses` reads
 /// /etc/hosts, then DNS); tests substitute fixed answers.

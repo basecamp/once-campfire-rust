@@ -7,10 +7,11 @@ use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
+use futures_util::future::BoxFuture;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
-use super::net::{BoxFuture, Dialer, Network, Resolver};
+use super::net::{Dialer, Network, Resolver};
 
 /// Fixed answers per host. A host with several answer lists gives the next one on each lookup
 /// and then keeps giving the last (like the Ruby tests' `Resolv.stubs(...).returns(a, b)`).
