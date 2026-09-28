@@ -3,7 +3,6 @@
 //! plus the outer middleware that must run before routing (`Rack::MethodOverride`,
 //! `ActionDispatch::SSL`, `ActionDispatch::RequestId`).
 
-use std::future::Future;
 use std::net::SocketAddr;
 
 use axum::Router;

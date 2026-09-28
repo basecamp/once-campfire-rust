@@ -9,7 +9,6 @@
 //! An upgraded connection (Action Cable's WebSocket) has none: Go clears the deadlines when
 //! `httputil.ReverseProxy` hijacks it.
 
-use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};

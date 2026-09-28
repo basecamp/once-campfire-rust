@@ -14,7 +14,6 @@
 //! synchronous Action Cable broadcast), so it goes straight to the cable server.
 
 use std::collections::HashMap;
-use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
