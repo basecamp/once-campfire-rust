@@ -10,7 +10,7 @@ rusqlite.workspace = true
 jiff.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-serde_yaml = { workspace = true, optional = true }
+serde_yaml_ng = { workspace = true, optional = true }
 thiserror.workspace = true
 tokio.workspace = true
 bcrypt.workspace = true
@@ -24,7 +24,7 @@ base64.workspace = true
 
 [features]
 # `campfire_db::fixtures`: the reference's test fixtures, loaded into a database for tests.
-test-support = ["dep:serde_yaml"]
+test-support = ["dep:serde_yaml_ng"]
 
 [dev-dependencies]
 campfire_db = { path = ".", features = ["test-support"] }
