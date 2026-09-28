@@ -313,7 +313,6 @@ struct FixtureAuth {
     tokens: BTreeMap<String, String>,
 }
 
-#[async_trait::async_trait]
 impl Authenticate<User> for FixtureAuth {
     async fn connect(&self, request: &ConnectRequest) -> Option<User> {
         (request.headers.get("cookie")?.to_str().ok()? == self.cookie).then(|| User {

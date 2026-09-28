@@ -30,7 +30,6 @@ impl Identified for User {
 /// `Cookie: session_token=<user id>`; users 1 and 2 exist, and both are members of room 1 only.
 struct CookieAuth;
 
-#[async_trait::async_trait]
 impl Authenticate<User> for CookieAuth {
     async fn connect(&self, request: &ConnectRequest) -> Option<User> {
         let cookie = request.headers.get("cookie")?.to_str().ok()?;
