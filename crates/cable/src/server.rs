@@ -7,10 +7,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use axum::extract::Request;
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
+use futures_util::future::BoxFuture;
 use serde::Serialize;
 use tokio::sync::{broadcast, watch};
 
-use crate::channel::Channel;
+use crate::channel::{Channel, DynChannel};
 use crate::pubsub::{Frame, Hub};
 use crate::socket::Handshake;
 use crate::{connection, json, naming, protocol};
@@ -58,9 +59,18 @@ pub struct ConnectRequest {
 
 /// `ApplicationCable::Connection#connect`: resolve the request (the `session_token` cookie) to
 /// the connection's identity, or `None` for `reject_unauthorized_connection`.
-#[async_trait::async_trait]
 pub trait Authenticate<U>: Send + Sync + 'static {
-    async fn connect(&self, request: &ConnectRequest) -> Option<U>;
+    fn connect(&self, request: &ConnectRequest) -> impl Future<Output = Option<U>> + Send;
+}
+
+pub(crate) trait DynAuthenticate<U>: Send + Sync + 'static {
+    fn connect<'a>(&'a self, request: &'a ConnectRequest) -> BoxFuture<'a, Option<U>>;
+}
+
+impl<U: 'static, A: Authenticate<U>> DynAuthenticate<U> for A {
+    fn connect<'a>(&'a self, request: &'a ConnectRequest) -> BoxFuture<'a, Option<U>> {
+        Box::pin(Authenticate::connect(self, request))
+    }
 }
 
 /// `identified_by`: the connection identifier used for remote disconnects. For
@@ -69,11 +79,11 @@ pub trait Identified {
     fn connection_identifier(&self) -> String;
 }
 
-type ChannelFactory<U> = Arc<dyn Fn() -> Box<dyn Channel<U>> + Send + Sync>;
+type ChannelFactory<U> = Arc<dyn Fn() -> Box<dyn DynChannel<U>> + Send + Sync>;
 
 pub struct ServerBuilder<U: Send + Sync + 'static> {
     config: Config,
-    authenticator: Arc<dyn Authenticate<U>>,
+    authenticator: Arc<dyn DynAuthenticate<U>>,
     channels: HashMap<String, ChannelFactory<U>>,
 }
 
@@ -85,7 +95,7 @@ impl<U: Identified + Send + Sync + 'static> ServerBuilder<U> {
         C: Channel<U>,
         F: Fn() -> C + Send + Sync + 'static,
     {
-        self.channels.insert(class_name.to_string(), Arc::new(move || Box::new(factory()) as Box<dyn Channel<U>>));
+        self.channels.insert(class_name.to_string(), Arc::new(move || Box::new(factory()) as Box<dyn DynChannel<U>>));
         self
     }
 
@@ -117,7 +127,7 @@ impl<U: Send + Sync + 'static> Clone for Server<U> {
 struct Inner<U: Send + Sync + 'static> {
     config: Config,
     hub: Arc<Hub>,
-    authenticator: Arc<dyn Authenticate<U>>,
+    authenticator: Arc<dyn DynAuthenticate<U>>,
     channels: HashMap<String, ChannelFactory<U>>,
     heartbeat: OnceLock<watch::Receiver<Frame>>,
     restart: broadcast::Sender<()>,
@@ -177,7 +187,7 @@ impl<U: Send + Sync + 'static> Server<U> {
         &self.inner.hub
     }
 
-    pub(crate) fn authenticator(&self) -> &Arc<dyn Authenticate<U>> {
+    pub(crate) fn authenticator(&self) -> &Arc<dyn DynAuthenticate<U>> {
         &self.inner.authenticator
     }
 

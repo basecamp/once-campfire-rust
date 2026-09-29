@@ -338,7 +338,6 @@ dependencies = [
  "aes-gcm",
  "anyhow",
  "askama",
- "async-trait",
  "axum",
  "base64 0.22.1",
  "bytes",
@@ -397,7 +396,6 @@ dependencies = [
 name = "campfire_cable"
 version = "0.1.0"
 dependencies = [
- "async-trait",
  "axum",
  "base64 0.22.1",
  "flate2",
@@ -427,7 +425,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
- "serde_yaml",
+ "serde_yaml_ng",
  "sha1",
  "tempfile",
  "thiserror",
@@ -2361,10 +2359,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "serde_yaml"
-version = "0.9.34+deprecated"
+name = "serde_yaml_ng"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a8b1a1a2ebf674015cc02edccce75287f1a0130d394307b36743c2f5d504b47"
+checksum = "7b4db627b98b36d4203a7b458cf3573730f2bb591b28871d916dfa9efabfd41f"
 dependencies = [
  "indexmap",
  "itoa",

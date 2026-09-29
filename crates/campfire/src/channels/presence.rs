@@ -70,7 +70,6 @@ fn nil_membership() -> ChannelError {
     ChannelError("undefined method for nil (membership)".into())
 }
 
-#[async_trait::async_trait]
 impl Channel<CableUser> for PresenceChannel {
     /// `subscribed`, then `on_subscribe :present, unless: :subscription_rejected?`.
     async fn subscribed(&mut self, sub: &mut Subscription<CableUser>) -> ChannelResult {

@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use jiff::SignedDuration;
 use rusqlite::Connection;
 use rusqlite::types::Value;
-use serde_yaml::Value as Yaml;
+use serde_yaml_ng::Value as Yaml;
 
 use crate::error::{Error, Result};
 use crate::models::{Involvement, Role, Status, user};
@@ -172,7 +172,7 @@ fn load_files(
         let source = std::fs::read_to_string(file)
             .map_err(|e| Error::Other(format!("{}: {e}", file.display())))?;
         let yaml = erb.render(&source)?;
-        let rows: Yaml = serde_yaml::from_str(&yaml)
+        let rows: Yaml = serde_yaml_ng::from_str(&yaml)
             .map_err(|e| Error::Other(format!("{}: {e}", file.display())))?;
 
         conn.execute(&format!(r#"DELETE FROM "{table}""#), [])?;
@@ -297,7 +297,7 @@ fn yaml_to_sql(table: &str, column: &str, value: Yaml) -> Result<Value> {
             }
         }
         other => Value::Text(
-            serde_yaml::to_string(&other)
+            serde_yaml_ng::to_string(&other)
                 .unwrap_or_default()
                 .trim()
                 .to_string(),

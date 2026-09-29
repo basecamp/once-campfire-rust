@@ -25,7 +25,7 @@ tower-http   = { version = "0.6", features = ["limit", "timeout", "fs"] }
 hyper        = "1"
 serde        = { version = "1", features = ["derive"] }
 serde_json   = { version = "1", features = ["preserve_order"] }
-serde_yaml   = "0.9"
+serde_yaml_ng = "0.10"
 rusqlite     = { version = "0.37", features = ["bundled", "functions", "hooks", "serde_json"] }
 askama       = "0.14"
 jiff         = { version = "0.2", features = ["serde"] }
@@ -48,7 +48,6 @@ uuid         = { version = "1", features = ["v4"] }
 percent-encoding = "2"
 url          = "2"
 regex        = "1"
-async-trait  = "0.1"
 libc         = "0.2"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 tokio-tungstenite = "0.29"

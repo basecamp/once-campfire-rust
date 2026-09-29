@@ -25,7 +25,6 @@ impl SessionAuthenticator {
     }
 }
 
-#[async_trait::async_trait]
 impl Authenticate<CableUser> for SessionAuthenticator {
     async fn connect(&self, request: &ConnectRequest) -> Option<CableUser> {
         let token = self.session_token(request)?;

@@ -30,7 +30,6 @@ impl Identified for User {
 /// `Cookie: session_token=<user id>`; users 1 and 2 exist, and both are members of room 1 only.
 struct CookieAuth;
 
-#[async_trait::async_trait]
 impl Authenticate<User> for CookieAuth {
     async fn connect(&self, request: &ConnectRequest) -> Option<User> {
         let cookie = request.headers.get("cookie")?.to_str().ok()?;
@@ -48,7 +47,6 @@ struct RoomChannel {
 
 pub type Log = Arc<Mutex<Vec<String>>>;
 
-#[async_trait::async_trait]
 impl Channel<User> for RoomChannel {
     async fn subscribed(&mut self, sub: &mut Subscription<User>) -> ChannelResult {
         let room_id = sub.param("room_id").as_ref().and_then(Value::as_u64);

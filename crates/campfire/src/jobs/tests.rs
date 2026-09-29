@@ -20,16 +20,19 @@ async fn app() -> (Booted, tempfile::TempDir) {
 }
 
 /// A handler that reports each event it performs, after `gate` lets it through (when given).
-fn reporting(performed: UnboundedSender<Event>, gate: Option<Arc<Notify>>) -> impl Handler {
+fn reporting(
+    performed: UnboundedSender<Event>,
+    gate: Option<Arc<Notify>>,
+) -> impl Fn(App, Event) -> BoxFuture<'static, anyhow::Result<()>> + Send + Sync + 'static {
     move |_app: App, event: Event| {
         let (performed, gate) = (performed.clone(), gate.clone());
-        async move {
+        Box::pin(async move {
             if let Some(gate) = gate {
                 gate.notified().await;
             }
             let _ = performed.send(event);
             Ok(())
-        }
+        })
     }
 }
 

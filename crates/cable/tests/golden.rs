@@ -313,7 +313,6 @@ struct FixtureAuth {
     tokens: BTreeMap<String, String>,
 }
 
-#[async_trait::async_trait]
 impl Authenticate<User> for FixtureAuth {
     async fn connect(&self, request: &ConnectRequest) -> Option<User> {
         (request.headers.get("cookie")?.to_str().ok()? == self.cookie).then(|| User {
@@ -336,7 +335,6 @@ fn subscribe_to_room(sub: &mut Subscription<User>) -> Option<u64> {
 
 struct RoomChannel;
 
-#[async_trait::async_trait]
 impl Channel<User> for RoomChannel {
     async fn subscribed(&mut self, sub: &mut Subscription<User>) -> ChannelResult {
         subscribe_to_room(sub);
@@ -349,7 +347,6 @@ struct TypingNotificationsChannel {
     room: Option<String>,
 }
 
-#[async_trait::async_trait]
 impl Channel<User> for TypingNotificationsChannel {
     async fn subscribed(&mut self, sub: &mut Subscription<User>) -> ChannelResult {
         self.room = subscribe_to_room(sub).map(|id| format!("room-{id}"));

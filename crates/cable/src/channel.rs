@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use serde::Serialize;
 use serde_json::{Map, Value};
+use futures_util::future::BoxFuture;
 use futures_util::stream::{AbortHandle, AbortRegistration};
 
 use crate::pubsub::Subscriber;
@@ -30,26 +31,45 @@ pub type ChannelResult<T = ()> = Result<T, ChannelError>;
 /// Rails' `on_subscribe`/`on_unsubscribe` callbacks run after `subscribed`/`unsubscribed`, so put
 /// them at the end of these methods (guarding on [`Subscription::rejected`] where the Ruby does
 /// `unless: :subscription_rejected?`).
-#[async_trait::async_trait]
 pub trait Channel<U: Send + Sync + 'static>: Send + 'static {
-    async fn subscribed(&mut self, sub: &mut Subscription<U>) -> ChannelResult {
+    fn subscribed(&mut self, sub: &mut Subscription<U>) -> impl Future<Output = ChannelResult> + Send {
         let _ = sub;
-        Ok(())
+        async { Ok(()) }
     }
 
     /// Also runs when a subscription is rejected, as in Rails (`reject_subscription` removes the
     /// subscription, which calls `unsubscribe_from_channel`).
-    async fn unsubscribed(&mut self, sub: &mut Subscription<U>) -> ChannelResult {
+    fn unsubscribed(&mut self, sub: &mut Subscription<U>) -> impl Future<Output = ChannelResult> + Send {
         let _ = sub;
-        Ok(())
+        async { Ok(()) }
     }
 
     /// Dispatches a `perform` from the client. Return `Ok(false)` when `action` isn't one of the
     /// channel's public methods, which Rails logs as "Unable to process". `action` is
     /// `data["action"]`, or `"receive"` when that's blank.
-    async fn perform(&mut self, action: &str, data: &Params, sub: &mut Subscription<U>) -> ChannelResult<bool> {
+    fn perform(&mut self, action: &str, data: &Params, sub: &mut Subscription<U>) -> impl Future<Output = ChannelResult<bool>> + Send {
         let _ = (action, data, sub);
-        Ok(false)
+        async { Ok(false) }
+    }
+}
+
+pub(crate) trait DynChannel<U: Send + Sync + 'static>: Send + 'static {
+    fn subscribed<'a>(&'a mut self, sub: &'a mut Subscription<U>) -> BoxFuture<'a, ChannelResult>;
+    fn unsubscribed<'a>(&'a mut self, sub: &'a mut Subscription<U>) -> BoxFuture<'a, ChannelResult>;
+    fn perform<'a>(&'a mut self, action: &'a str, data: &'a Params, sub: &'a mut Subscription<U>) -> BoxFuture<'a, ChannelResult<bool>>;
+}
+
+impl<U: Send + Sync + 'static, C: Channel<U>> DynChannel<U> for C {
+    fn subscribed<'a>(&'a mut self, sub: &'a mut Subscription<U>) -> BoxFuture<'a, ChannelResult> {
+        Box::pin(Channel::subscribed(self, sub))
+    }
+
+    fn unsubscribed<'a>(&'a mut self, sub: &'a mut Subscription<U>) -> BoxFuture<'a, ChannelResult> {
+        Box::pin(Channel::unsubscribed(self, sub))
+    }
+
+    fn perform<'a>(&'a mut self, action: &'a str, data: &'a Params, sub: &'a mut Subscription<U>) -> BoxFuture<'a, ChannelResult<bool>> {
+        Box::pin(Channel::perform(self, action, data, sub))
     }
 }
 

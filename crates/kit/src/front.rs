@@ -26,7 +26,6 @@ mod conn;
 mod handler;
 mod tls;
 
-use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
