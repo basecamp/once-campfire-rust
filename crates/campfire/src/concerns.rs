@@ -278,7 +278,11 @@ pub async fn authenticate_by(c: &Ctx, email_address: String, password: String) -
 pub async fn start_new_session_for(c: &mut Ctx, user: User) -> Result<Session> {
     let (user_agent, ip) = (c.request.user_agent().map(str::to_string), c.request.remote_ip()?.to_string());
     let user_id = user.id;
-    let session = c.app().write(move |tx| Session::start(tx, user_id, user_agent.as_deref(), Some(&ip))).await?;
+    let session =
+        c.app().db.write(move |tx| Session::start(tx, user_id, user_agent.as_deref(), Some(&ip))).await.map_err(|error| match error {
+            campfire_db::Error::RecordNotFound("User") => Error::Status(StatusCode::UNAUTHORIZED),
+            error => Error::internal(error),
+        })?;
     authenticated_as(c, session.clone(), Some(user), true).await?;
     Ok(session)
 }
@@ -520,6 +524,12 @@ pub fn head(status: StatusCode) -> campfire_kit::Response {
 
 #[cfg(test)]
 mod tests {
+    use axum::body::Body;
+    use axum::http::{Request, header};
+    use campfire_db::NewUser;
+    use campfire_kit::{Kit, KitConfig};
+    use tower::ServiceExt;
+
     use super::*;
 
     #[test]
@@ -529,5 +539,72 @@ mod tests {
         assert!(!before.deny_bots);
         assert!(!before.forgery_protection);
         assert_eq!(Before::default().require_unauthenticated_access().authentication, Authentication::RequireUnauthenticated);
+    }
+
+    // Revoke between password verification and session creation.
+    async fn login_with_revocation(c: &mut Ctx) -> Result {
+        let user = authenticate_by(c, "user@example.com".into(), "secret".into()).await?.unwrap();
+        let id = user.id;
+        let revoke = c.param_str("revoke").unwrap_or_default().to_string();
+        c.app()
+            .db
+            .write(move |tx| {
+                let mut user = User::find(tx.conn(), id)?;
+                match revoke.as_str() {
+                    "ban" => user.ban(tx),
+                    "deactivate" => user.deactivate(tx),
+                    _ => Ok(()),
+                }
+            })
+            .await
+            .map_err(Error::internal)?;
+        start_new_session_for(c, user).await?;
+        Ok(c.head(StatusCode::OK))
+    }
+
+    #[tokio::test]
+    async fn revoked_login_does_not_issue_an_authentication_cookie() {
+        for revoke in ["ban", "deactivate", "none"] {
+            let dir = tempfile::tempdir().unwrap();
+            let config = crate::config::Config::from_lookup(|key| match key {
+                "SECRET_KEY_BASE" => Some("session-revocation-test-secret".into()),
+                "DISABLE_SSL" => Some("true".into()),
+                "CAMPFIRE_STORAGE_PATH" => Some(dir.path().to_string_lossy().into_owned()),
+                _ => None,
+            })
+            .unwrap();
+            let booted = crate::app::boot(config).await.unwrap();
+            let digest = PasswordDigest::hash("secret".into(), 4).await.unwrap();
+            let user = booted
+                .app
+                .db
+                .write(move |tx| {
+                    User::create(
+                        tx,
+                        NewUser {
+                            name: "User".into(),
+                            email_address: Some("user@example.com".into()),
+                            password_digest: Some(digest),
+                            ..NewUser::default()
+                        },
+                    )
+                })
+                .await
+                .unwrap();
+            let app = booted.app.clone();
+            let kit = Kit::new(KitConfig::production(true), app.secrets.clone(), app.clock.clone(), app.clone());
+            let router = campfire_kit::app(axum::Router::new().route("/login", campfire_kit::post(login_with_revocation)), kit);
+            let request =
+                Request::post(format!("/login?revoke={revoke}")).header(header::HOST, "campfire.test").body(Body::empty()).unwrap();
+            let response = router.oneshot(request).await.unwrap();
+            let allowed = revoke == "none";
+            assert_eq!(response.status(), if allowed { StatusCode::OK } else { StatusCode::UNAUTHORIZED });
+            let has_cookie =
+                response.headers().get_all(header::SET_COOKIE).iter().any(|v| v.to_str().unwrap().starts_with("session_token="));
+            assert_eq!(has_cookie, allowed, "{revoke}");
+            let count = app.db.read(move |conn| Session::count_for_user(conn, user.id)).await.unwrap();
+            assert_eq!(count, i64::from(allowed), "{revoke}");
+            booted.jobs.shutdown(std::time::Duration::from_secs(5)).await;
+        }
     }
 }

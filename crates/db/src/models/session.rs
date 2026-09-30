@@ -4,7 +4,8 @@ use jiff::SignedDuration;
 use rusqlite::{Connection, Row, params};
 
 use crate::database::Tx;
-use crate::error::{OptionalExt, Result};
+use crate::error::{Error, OptionalExt, Result};
+use crate::models::User;
 use crate::sql::{self, CachedStatements, query_all, query_one};
 use crate::time::Timestamp;
 
@@ -41,9 +42,14 @@ impl Session {
         query_one(conn, r#"SELECT * FROM "sessions" WHERE "sessions"."id" = ? LIMIT 1"#, [id], Self::from_row)?.or_not_found("Session")
     }
 
-    /// `Session.find_by(token:)`
+    /// `Session.find_by(token:)`, restricted to active users.
     pub fn find_by_token(conn: &Connection, token: &str) -> Result<Option<Self>> {
-        query_one(conn, r#"SELECT * FROM "sessions" WHERE "sessions"."token" = ? LIMIT 1"#, [token], Self::from_row)
+        query_one(
+            conn,
+            r#"SELECT "sessions".* FROM "sessions" INNER JOIN "users" ON "users"."id" = "sessions"."user_id" WHERE "sessions"."token" = ? AND "users"."status" = 0 LIMIT 1"#,
+            [token],
+            Self::from_row,
+        )
     }
 
     pub fn for_user(conn: &Connection, user_id: i64) -> Result<Vec<Self>> {
@@ -57,6 +63,10 @@ impl Session {
     /// `user.sessions.start!(user_agent:, ip_address:)`: a new 24-character base58
     /// `has_secure_token`, and `last_active_at ||= Time.now` in `before_create`.
     pub fn start(tx: &mut Tx<'_>, user_id: i64, user_agent: Option<&str>, ip_address: Option<&str>) -> Result<Self> {
+        // A ban or deactivation may have committed during password verification.
+        if !User::find(tx.conn(), user_id)?.is_active() {
+            return Err(Error::RecordNotFound("User"));
+        }
         let now = tx.now();
         let last_active_at = tx.now();
         let token = sql::base58(24);

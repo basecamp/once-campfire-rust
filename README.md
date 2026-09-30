@@ -435,6 +435,8 @@ Deliberate:
 - **Passwords are hashed and checked outside the database.** bcrypt (about 250 ms) runs before the
   write that saves a password, and a sign-in looks the user up and then verifies the password after
   releasing the database connection. An unknown email address still costs one bcrypt, as in Rails.
+- **Revoked accounts cannot create or resume sessions.** Session creation rechecks account status
+  in the transaction; HTTP and Action Cable also reject surviving sessions for inactive users.
 - **Searches are for words.** Rails passes a search's words to SQLite's full-text `MATCH` as they
   are, so `NOT`, `AND`, `OR` or `NEAR` in the wrong place is a 500. Each word is now matched as
   itself.

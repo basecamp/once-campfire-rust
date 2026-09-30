@@ -127,3 +127,20 @@ async fn only_the_revoked_users_connections_are_closed() {
     app.server.broadcast(&format!("room:{}", room_gid(&designers).to_param()), &json!({ "still": "here" }));
     assert_eq!(jz.next_text().await, delivery(&room, r#"{"still":"here"}"#));
 }
+
+#[tokio::test]
+async fn inactive_users_cannot_connect_with_a_surviving_session() {
+    let app = start().await;
+    let cookie = app.cookie_for("kevin").await;
+    for status in [campfire_db::Status::Banned, campfire_db::Status::Deactivated] {
+        app.db
+            .write(move |tx| {
+                tx.conn().execute("UPDATE users SET status = ? WHERE id = ?", rusqlite::params![status, id("kevin")])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let mut client = app.connect_with_cookie(Some(&cookie)).await;
+        assert_eq!(client.until_closed().await, vec![UNAUTHORIZED.to_string()]);
+    }
+}

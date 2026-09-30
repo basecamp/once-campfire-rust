@@ -273,3 +273,35 @@ fn remove_banned_content() {
     assert_eq!(removed.len(), 5);
     assert!(t.read(|c| Message::by_creator(c, id("jz"))).is_empty());
 }
+
+#[test]
+fn session_creation_rechecks_status_after_password_verification() {
+    for banned in [false, true] {
+        let t = TestDb::new();
+        let candidate = create_new_user(&t);
+        let user_id = candidate.id;
+        t.write(move |tx| {
+            let mut user = User::find(tx.conn(), user_id)?;
+            if banned { user.ban(tx) } else { user.deactivate(tx) }
+        });
+        let authenticated = User::authenticated(Some(candidate), "secret123456").unwrap();
+        let result = t.try_write(move |tx| Session::start(tx, authenticated.id, None, Some("8.8.8.8")));
+        assert!(matches!(result, Err(crate::Error::RecordNotFound("User"))), "{result:?}");
+        assert_eq!(t.read(|conn| Session::count_for_user(conn, user_id)), 0);
+    }
+}
+
+#[test]
+fn session_lookup_rejects_inactive_users_with_surviving_session_rows() {
+    let t = TestDb::new();
+    let user_id = create_new_user(&t).id;
+    let session = t.write(move |tx| Session::start(tx, user_id, None, None));
+    for status in [Status::Banned, Status::Deactivated] {
+        t.write(move |tx| {
+            tx.conn().execute("UPDATE users SET status = ? WHERE id = ?", rusqlite::params![status, user_id])?;
+            Ok(())
+        });
+        assert!(t.read(|conn| Session::find_by_token(conn, &session.token)).is_none());
+        assert_eq!(t.read(|conn| Session::count_for_user(conn, user_id)), 1);
+    }
+}
