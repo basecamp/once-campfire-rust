@@ -114,6 +114,7 @@ ARG TARGETARCH
 
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
+COPY .cargo .cargo
 COPY crates crates
 # crates/assets/build.rs digests and embeds the reference's assets and public/ at build time.
 COPY reference reference
