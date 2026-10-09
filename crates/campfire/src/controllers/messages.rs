@@ -221,15 +221,18 @@ pub(crate) async fn create_message(c: &Ctx, room: &Room, attributes: MessagePara
         Some(Assignment::Invalid) => return Err(invalid_attachment()),
         _ => None,
     };
-    let body = match attributes.body {
-        Some(body) => Some(canonicalize_body(c.app(), body, Some(c.request.host())).await?),
-        None => None,
+    let (body, plain_text) = match attributes.body {
+        Some(body) => {
+            let (body, plain_text) = canonicalize_body_with_plain_text(c.app(), body, Some(c.request.host())).await?;
+            (Some(body), plain_text)
+        }
+        None => (None, None),
     };
     let (message, blob) = c
         .app()
         .write(move |tx| {
             let blob = attachment.map(|staged| save_staged(tx, staged)).transpose()?;
-            let message = Message::create(
+            let message = Message::create_prepared(
                 tx,
                 NewMessage {
                     room_id,
@@ -238,6 +241,7 @@ pub(crate) async fn create_message(c: &Ctx, room: &Room, attributes: MessagePara
                     body,
                     attachment_blob_id: blob.as_ref().map(|blob| blob.id),
                 },
+                plain_text,
             )?;
             Ok((message, blob))
         })
@@ -263,6 +267,65 @@ pub(crate) fn save_staged(tx: &mut campfire_db::Tx<'_>, staged: Staged) -> campf
 pub(crate) async fn canonicalize_body(app: &App, body: String, request_host: Option<String>) -> Result<String> {
     let app2 = app.clone();
     app.read(move |conn| Ok(canonical_body(conn, &app2, &body, request_host))).await
+}
+
+/// [`canonicalize_body`], with the canonical body's plain text when it has no attachments. Only
+/// attachments read records (mentions their users), so such a body is canonicalized and its plain
+/// text worked out right here, holding no reader connection and leaving the write only its
+/// statements. A body with attachments is canonicalized on a reader and gets no plain text: the
+/// write reads its records, where they're current.
+pub(crate) async fn canonicalize_body_with_plain_text(
+    app: &App,
+    body: String,
+    request_host: Option<String>,
+) -> Result<(String, Option<String>)> {
+    if let Some(prepared) = prepare_without_records(&body, request_host.clone()) {
+        return Ok(prepared);
+    }
+    Ok((canonicalize_body(app, body, request_host).await?, None))
+}
+
+/// [`canonical_body`] and `to_plain_text` of a body that names no records, or `None` if it may.
+/// Rendering asks its resolver only about attachments, so a body without any never asks: if this
+/// one did, the markup check missed something, and the result is set aside for the reader's.
+fn prepare_without_records(body: &str, request_host: Option<String>) -> Option<(String, Option<String>)> {
+    if may_have_attachments(body) {
+        return None;
+    }
+    let resolver = NoRecords::default();
+    let ctx = campfire_richtext::RenderContext { resolver: &resolver, request_host };
+    let canonical = Content::load(body, &ctx).map(|content| content.to_html()).unwrap_or_else(|_| body.to_string());
+    // As `AppRichText::to_plain_text`, which renders without a request host.
+    let ctx = campfire_richtext::RenderContext { resolver: &resolver, request_host: None };
+    let plain_text = campfire_richtext::to_plain_text(&canonical, &ctx).unwrap_or_else(|error| {
+        tracing::error!(%error, "to_plain_text raised");
+        String::new()
+    });
+    (!resolver.asked.get()).then_some((canonical, Some(plain_text)))
+}
+
+/// A resolver with no records to find, which notes whether it was asked.
+#[derive(Default)]
+struct NoRecords {
+    asked: std::cell::Cell<bool>,
+}
+
+impl campfire_richtext::AttachableResolver for NoRecords {
+    fn locate_signed(&self, _: &str) -> campfire_richtext::SignedLookup {
+        self.asked.set(true);
+        campfire_richtext::SignedLookup::Invalid
+    }
+
+    fn find_gid(&self, _: &str) -> campfire_richtext::GidLookup {
+        self.asked.set(true);
+        campfire_richtext::GidLookup::NotFound
+    }
+}
+
+/// Whether `html` may hold an attachment, in Action Text's markup or Trix's, in any case.
+fn may_have_attachments(html: &str) -> bool {
+    let html = html.to_ascii_lowercase();
+    html.contains("action-text-attachment") || html.contains("data-trix-attachment")
 }
 
 /// Assigning a String to a rich text attribute stores the canonicalized content

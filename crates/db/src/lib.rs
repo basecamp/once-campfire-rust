@@ -22,7 +22,7 @@ mod sql;
 
 pub use sql::{CachedStatements, placeholders, query_all, query_one};
 
-pub use database::{Config, Database, Env, Tx, run_write};
+pub use database::{Config, Database, Env, Tx, in_read_transaction, run_write};
 pub use error::{Error, Errors, Result};
 pub use events::{Event, EventSink};
 pub use models::*;

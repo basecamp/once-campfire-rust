@@ -166,6 +166,28 @@ pub fn run_write<T>(conn: &Connection, env: &Env, f: impl FnOnce(&mut Tx<'_>) ->
     }
 }
 
+/// Runs `f`'s reads in one read transaction: one snapshot for all of them, and the WAL read lock
+/// taken and released once, where each statement on its own takes and releases its own (in one
+/// process, often an `fcntl` each way). The transaction ends however `f` does, panics included,
+/// so the connection never goes back to the readers inside it.
+pub fn in_read_transaction<T>(conn: &Connection, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+    struct End<'c>(&'c Connection);
+    impl Drop for End<'_> {
+        fn drop(&mut self) {
+            if !self.0.is_autocommit() {
+                let _ = self.0.prepare_cached("ROLLBACK").and_then(|mut rollback| rollback.execute([]));
+            }
+        }
+    }
+    conn.prepare_cached("BEGIN")?.execute([])?;
+    let end = End(conn);
+    let value = f(conn)?;
+    // Ending a read transaction releases its snapshot: COMMIT and ROLLBACK do the same.
+    conn.prepare_cached("COMMIT")?.execute([])?;
+    drop(end);
+    Ok(value)
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub path: PathBuf,

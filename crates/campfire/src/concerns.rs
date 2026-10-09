@@ -212,13 +212,39 @@ pub async fn require_authentication(c: &mut Ctx) -> Result<()> {
 
 /// `restore_authentication`: resume the session named by the `session_token` cookie.
 pub async fn restore_authentication(c: &mut Ctx) -> Result<bool> {
-    match find_session_by_cookie(c).await? {
-        Some(session) => {
-            resume_session(c, session).await?;
+    match find_session_and_user_by_cookie(c).await? {
+        Some((session, user)) => {
+            resume_session(c, session, user).await?;
             Ok(true)
         }
         None => Ok(false),
     }
+}
+
+/// [`find_session_by_cookie`] with the session's user (`session.user`), both read in one read
+/// transaction, or as read earlier in the request's database version.
+async fn find_session_and_user_by_cookie(c: &Ctx) -> Result<Option<(Session, Option<User>)>> {
+    let Some(token) = c.cookies.signed("session_token") else { return Ok(None) };
+    let generation = crate::response_cache::reads_generation(c);
+    let reads = &c.app().response_cache.reads.sessions;
+    if let Some(found) = generation.and_then(|generation| reads.get(generation, token.as_str())) {
+        return Ok(Some(found));
+    }
+    let key = token.clone();
+    let found = c
+        .app()
+        .read(move |conn| {
+            campfire_db::in_read_transaction(conn, |conn| {
+                let Some(session) = Session::find_by_token(conn, &token)? else { return Ok(None) };
+                let user = User::find_by_id(conn, session.user_id)?;
+                Ok(Some((session, user)))
+            })
+        })
+        .await?;
+    if let (Some(generation), Some(found)) = (generation, &found) {
+        reads.insert(generation, key, found.clone());
+    }
+    Ok(found)
 }
 
 /// `bot_authentication`: `params[:bot_key].present?` and a matching active bot.
@@ -289,7 +315,9 @@ pub async fn start_new_session_for(c: &mut Ctx, user: User) -> Result<Session> {
 /// behind every write for nothing. The `session_token` cookie is re-signed on the same schedule
 /// rather than on every request as Rails does, which keeps its 20-year expiry rolling without a
 /// cookie on every response.
-pub async fn resume_session(c: &mut Ctx, session: Session) -> Result<()> {
+///
+/// `user` is the session's user when already read (`None` reads it).
+pub async fn resume_session(c: &mut Ctx, session: Session, user: Option<User>) -> Result<()> {
     let refresh = session.needs_resume(campfire_db::Timestamp::from_jiff(c.now()));
     let session = if refresh {
         let (user_agent, ip) = (c.request.user_agent().map(str::to_string), c.request.remote_ip()?.to_string());
@@ -303,7 +331,7 @@ pub async fn resume_session(c: &mut Ctx, session: Session) -> Result<()> {
     } else {
         session
     };
-    authenticated_as(c, session, None, refresh).await
+    authenticated_as(c, session, user, refresh).await
 }
 
 /// `authenticated_as(session)`: `Current.session = session` (which sets `Current.user` to
@@ -492,18 +520,30 @@ pub fn last_room_visited_in(conn: &campfire_db::Connection, user_id: i64, last_r
 pub async fn set_room(c: &mut Ctx) -> Result<(Membership, Room)> {
     let user_id = require_current_user(c)?.id;
     let Some(room_id) = c.param_str("room_id").and_then(integer_cast) else { return Err(Error::NotFound) };
-    c.app()
+    let generation = crate::response_cache::reads_generation(c);
+    let reads = &c.app().response_cache.reads.memberships;
+    if let Some(found) = generation.and_then(|generation| reads.get(generation, &(room_id, user_id))) {
+        return Ok(found);
+    }
+    let found = c
+        .app()
         .read(move |conn| {
-            let membership =
-                Membership::find_by_room_and_user(conn, room_id, user_id)?.ok_or(campfire_db::Error::RecordNotFound("Membership"))?;
-            // `@membership.room` is nil when the room is gone (memberships have no foreign key to
-            // rooms), and the action fails on it: a 500, where `Membership#room`'s
-            // `RecordNotFound` would be a 404.
-            let room =
-                Room::find_by_id(conn, membership.room_id)?.ok_or_else(|| campfire_db::Error::other("the membership's room is gone"))?;
-            Ok((membership, room))
+            campfire_db::in_read_transaction(conn, |conn| {
+                let membership =
+                    Membership::find_by_room_and_user(conn, room_id, user_id)?.ok_or(campfire_db::Error::RecordNotFound("Membership"))?;
+                // `@membership.room` is nil when the room is gone (memberships have no foreign key
+                // to rooms), and the action fails on it: a 500, where `Membership#room`'s
+                // `RecordNotFound` would be a 404.
+                let room = Room::find_by_id(conn, membership.room_id)?
+                    .ok_or_else(|| campfire_db::Error::other("the membership's room is gone"))?;
+                Ok((membership, room))
+            })
         })
-        .await
+        .await?;
+    if let Some(generation) = generation {
+        reads.insert(generation, (room_id, user_id), found.clone());
+    }
+    Ok(found)
 }
 
 // --- Helpers -------------------------------------------------------------------------------------

@@ -131,6 +131,9 @@ behavior changes and compatibility limits are listed below.
 - **SQLite:** boot adds `index_messages_on_room_id_and_created_at` and
   `index_messages_on_room_id_and_updated_at` if missing. They remain compatible with Rails.
   Memory mapping is disabled; reads use SQLite's page cache.
+- **Message creation:** the search index and unread memberships are written in the message's own
+  transaction, as current Rails does, rather than in commits of their own after it, so a message is
+  never stored without them.
 - **Media formats:** libvips 8.16.1 and ffmpeg 7.1.5 use the Rails image's Debian sources, with
   byte-identical thumbnails, posters and metadata for supported formats. libvips omits loaders
   Rails already blocks. ffmpeg omits external-library-only formats: tracker modules, game-console

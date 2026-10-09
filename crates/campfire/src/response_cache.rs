@@ -3,17 +3,22 @@
 //! Authentication and room access run before every lookup. A separate SQLite connection observes
 //! commits from every writer; its version is captured before authentication and checked again at
 //! lookup and admission. Thus a commit during authentication or rendering cannot populate the
-//! new version with an old authorization snapshot. Cookies, flash, HEAD and conditional GET
+//! new version with an old authorization snapshot. What authentication and room access read is
+//! itself reused within a version ([`Reads`]). Cookies, flash, HEAD and conditional GET
 //! still go through the kit on a hit. Only the completed, bounded identity/gzip representation is
 //! retained; Rust's Sec-Fetch-Site protection does not put CSRF secrets in these pages.
 
+use std::borrow::Borrow;
+use std::collections::HashMap;
+use std::hash::Hash;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use axum::body::{Body as AxumBody, Bytes};
 use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::middleware::Next;
+use campfire_db::{Membership, Room, Session, User};
 use campfire_kit::front::{CachedResponse, MemoryCache};
 use campfire_kit::{Body, Ctx, Response};
 use http_body_util::BodyExt;
@@ -28,10 +33,15 @@ const MAX_KEY_INPUT: usize = 8192;
 // Time-dependent links and dates still expire even without a database commit.
 const TTL: Duration = Duration::from_secs(15);
 
+/// Entries each [`GenerationCache`] keeps for its generation: well past the sessions and rooms in
+/// use between two commits.
+const READS_PER_GENERATION: usize = 4096;
+
 pub struct Store {
     observer: Mutex<Observer>,
     responses: MemoryCache,
     enabled: bool,
+    pub reads: Reads,
     #[cfg(test)]
     pub hits: std::sync::atomic::AtomicUsize,
 }
@@ -44,7 +54,9 @@ struct Observer {
 
 impl Observer {
     fn version(&mut self) -> rusqlite::Result<u64> {
-        let current = self.db.query_row("PRAGMA data_version", [], |row| row.get(0))?;
+        // Every request runs this under the store's lock: reuse the prepared statement rather than
+        // preparing and finalizing it each time.
+        let current = self.db.prepare_cached("PRAGMA data_version")?.query_row([], |row| row.get(0))?;
         if current != self.data_version {
             self.generation += 1;
             self.data_version = current;
@@ -62,6 +74,7 @@ impl Store {
             observer: Mutex::new(Observer { db, data_version, generation: 0 }),
             enabled: capacity != 0,
             responses: MemoryCache::new(capacity.min(i64::MAX as usize) as i64, (MAX_BODY * 2) as i64),
+            reads: Reads::default(),
             #[cfg(test)]
             hits: std::sync::atomic::AtomicUsize::new(0),
         }))
@@ -92,6 +105,63 @@ impl Store {
         let now = Instant::now();
         self.responses.set(ticket.key.clone(), response, now + TTL, now);
     }
+}
+
+/// What authentication and room access read, kept for the version they were read in. Every commit,
+/// another process's included, moves the version on, and a read is only kept under a version
+/// observed before it was made, so a request reusing one sees what a read of its own would have
+/// seen, or later. Kept only while the response cache is on, like the responses.
+#[derive(Default)]
+pub struct Reads {
+    /// `session_token` → the session and its user.
+    pub sessions: GenerationCache<String, (Session, Option<User>)>,
+    /// (user, room) → `Room::find_for_user`.
+    pub rooms: GenerationCache<(i64, i64), Room>,
+    /// (room, user) → the membership and its room.
+    pub memberships: GenerationCache<(i64, i64), (Membership, Room)>,
+}
+
+/// Values for one version at a time: storing under a later version drops the earlier one's.
+pub struct GenerationCache<K, V> {
+    entries: RwLock<(u64, HashMap<K, V>)>,
+}
+
+impl<K, V> Default for GenerationCache<K, V> {
+    fn default() -> Self {
+        Self { entries: RwLock::new((0, HashMap::new())) }
+    }
+}
+
+impl<K: Eq + Hash, V: Clone> GenerationCache<K, V> {
+    pub fn get<Q: Eq + Hash + ?Sized>(&self, generation: u64, key: &Q) -> Option<V>
+    where
+        K: Borrow<Q>,
+    {
+        let entries = self.entries.read().unwrap();
+        if entries.0 != generation {
+            return None;
+        }
+        entries.1.get(key).cloned()
+    }
+
+    pub fn insert(&self, generation: u64, key: K, value: V) {
+        let mut entries = self.entries.write().unwrap();
+        if generation > entries.0 {
+            *entries = (generation, HashMap::new());
+        }
+        if generation == entries.0 && entries.1.len() < READS_PER_GENERATION {
+            entries.1.insert(key, value);
+        }
+    }
+}
+
+/// The version this request's authentication and room access reads may be reused within: the one
+/// captured before authentication, while the response cache is on.
+pub fn reads_generation(c: &Ctx) -> Option<u64> {
+    if !c.app().response_cache.enabled {
+        return None;
+    }
+    c.current::<Snapshot>()?.generation
 }
 
 #[derive(Clone)]

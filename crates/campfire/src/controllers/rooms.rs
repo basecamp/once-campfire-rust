@@ -101,7 +101,7 @@ pub async fn set_room(c: &mut Ctx, scope: Scope) -> Result<Room> {
     let user_id = require_current_user(c)?.id;
     let id = c.param_str("room_id").or_else(|| c.param_str("id")).and_then(integer_cast);
     let room = match id {
-        Some(id) => c.app().read(move |conn| Room::find_for_user(conn, user_id, id)).await?,
+        Some(id) => room_for_user(c, user_id, id).await?,
         None => None,
     };
     match room.filter(|room| scope.includes(room)) {
@@ -112,6 +112,20 @@ pub async fn set_room(c: &mut Ctx, scope: Scope) -> Result<Room> {
             halt(c.redirect_to_with(&root, redirect)?)
         }
     }
+}
+
+/// `Room::find_for_user`, or as read earlier in the request's database version.
+async fn room_for_user(c: &Ctx, user_id: i64, id: i64) -> Result<Option<Room>> {
+    let generation = crate::response_cache::reads_generation(c);
+    let reads = &c.app().response_cache.reads.rooms;
+    if let Some(room) = generation.and_then(|generation| reads.get(generation, &(user_id, id))) {
+        return Ok(Some(room));
+    }
+    let room = c.app().read(move |conn| Room::find_for_user(conn, user_id, id)).await?;
+    if let (Some(generation), Some(room)) = (generation, &room) {
+        reads.insert(generation, (user_id, id), room.clone());
+    }
+    Ok(room)
 }
 
 /// `ensure_can_administer`: `head :forbidden unless Current.user.can_administer?(@room)`.

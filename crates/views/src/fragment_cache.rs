@@ -12,7 +12,12 @@
 //! [`PER_ENTRY_OVERHEAD`] bytes, and when a write takes the total past the limit, least recently
 //! used entries go until it's back to three quarters of it (`MemoryStore#prune`). Reads count as
 //! uses. An entry larger than a quarter of the limit is returned but not kept, so that one huge
-//! fragment can't flush everything else. Templates reach the store that's current on this thread:
+//! fragment can't flush everything else.
+//!
+//! Hits run concurrently: the map is split into shards under read-write locks, and a hit
+//! read-locks its key's shard and marks the entry used with an atomic, writing nothing shared.
+//! Stores, pruning and clearing take one lock between them, and prune before storing, so the
+//! entries never take more than the limit. Templates reach the store that's current on this thread:
 //! the app enters it for every request ([`Scoped`]) and for renders outside one ([`with`]).
 //! Without a current store, fragments render uncached (`perform_caching = false`).
 //!
@@ -22,11 +27,12 @@
 
 use std::any::Any;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::future::Future;
-use std::hash::{Hash, Hasher};
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::task::{Context, Poll};
 
 /// A rendered fragment as the store keeps it.
@@ -82,48 +88,138 @@ fn fitted(mut html: String) -> String {
     html
 }
 
+/// The parts of the store's map, each with its own lock: a hit read-locks only its key's part.
+const SHARDS: usize = 16;
+
 /// A byte-bounded in-process fragment store.
 pub struct FragmentCache {
     max_bytes: usize,
-    entries: Arc<Mutex<Entries>>,
+    entries: Arc<Entries>,
     namespace: u64,
     scope: Option<Arc<str>>,
 }
 
-#[derive(Default)]
 struct Entries {
-    values: HashMap<Arc<str>, Entry>,
-    /// Last use → key, oldest first.
-    recency: BTreeMap<u64, Arc<str>>,
-    clock: u64,
-    /// The sum of every entry's `size`.
-    bytes: usize,
+    shards: [RwLock<HashMap<Arc<str>, Entry>>; SHARDS],
+    hasher: foldhash::fast::RandomState,
+    /// Held by every change to the entries (storing, pruning, clearing), never by a hit, so that
+    /// changes and their byte count happen one at a time while hits carry on.
+    changing: Mutex<()>,
+    /// Advances with every store. A hit marks its entry used at the current value, a read of a
+    /// counter only stores write, so recency is exact up to stores: entries used between the same
+    /// two stores tie.
+    clock: AtomicU64,
+    /// The sum of every entry's `size`. Changed only while holding `changing`.
+    bytes: AtomicUsize,
+}
+
+impl Default for Entries {
+    fn default() -> Self {
+        Self {
+            shards: std::array::from_fn(|_| RwLock::default()),
+            hasher: foldhash::fast::RandomState::default(),
+            changing: Mutex::new(()),
+            clock: AtomicU64::new(0),
+            bytes: AtomicUsize::new(0),
+        }
+    }
 }
 
 struct Entry {
-    /// The map's key, shared with `recency`.
-    key: Arc<str>,
     value: Value,
-    used: u64,
+    /// The clock when it was last stored or used.
+    used: AtomicU64,
     size: usize,
 }
 
 impl Entry {
-    /// Marks the entry used at `now`.
-    fn touch(&mut self, recency: &mut BTreeMap<u64, Arc<str>>, now: u64) {
-        recency.remove(&self.used);
-        self.used = now;
-        recency.insert(now, self.key.clone());
+    /// Marks the entry used at `now`, writing only if that's later: hits on a hot entry between
+    /// two stores then only read it, and a hit that read the clock earlier never moves it back.
+    fn touch(&self, now: u64) {
+        if self.used.load(Ordering::Relaxed) < now {
+            self.used.fetch_max(now, Ordering::Relaxed);
+        }
     }
 }
 
+type Shard = RwLock<HashMap<Arc<str>, Entry>>;
+
+fn read_shard(shard: &Shard) -> RwLockReadGuard<'_, HashMap<Arc<str>, Entry>> {
+    shard.read().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn write_shard(shard: &Shard) -> RwLockWriteGuard<'_, HashMap<Arc<str>, Entry>> {
+    shard.write().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+impl Entries {
+    fn shard(&self, key: &str) -> &Shard {
+        &self.shards[self.hasher.hash_one(key) as usize % SHARDS]
+    }
+
+    fn changing(&self) -> MutexGuard<'_, ()> {
+        self.changing.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Removes least recently used entries until the rest take at most `target` bytes. Called
+    /// while changing. An entry a hit uses while this runs may still go, as it was the oldest.
+    fn prune(&self, target: usize) {
+        for (_, key) in self.by_use() {
+            if self.bytes.load(Ordering::Relaxed) <= target {
+                break;
+            }
+            if let Some(entry) = write_shard(self.shard(&key)).remove(&key) {
+                self.bytes.fetch_sub(entry.size, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+impl Entries {
+    /// Every entry's key and when it was last used, least recently used first.
+    fn by_use(&self) -> Vec<(u64, Arc<str>)> {
+        let mut by_use: Vec<(u64, Arc<str>)> = Vec::new();
+        for shard in &self.shards {
+            by_use.extend(read_shard(shard).iter().map(|(key, entry)| (entry.used.load(Ordering::Relaxed), key.clone())));
+        }
+        by_use.sort_unstable_by_key(|(used, _)| *used);
+        by_use
+    }
+}
+
+/// The entries as tests inspect them, taken while no change is in progress: each one's size, and
+/// the order pruning takes them in.
+#[cfg(test)]
+struct Inspected {
+    values: HashMap<Arc<str>, InspectedEntry>,
+    recency: Vec<(u64, Arc<str>)>,
+}
+
+#[cfg(test)]
+struct InspectedEntry {
+    size: usize,
+}
+
 impl FragmentCache {
+    #[cfg(test)]
+    fn lock(&self) -> Inspected {
+        let _changing = self.entries.changing();
+        let values = self
+            .entries
+            .shards
+            .iter()
+            .flat_map(|shard| {
+                read_shard(shard).iter().map(|(key, entry)| (key.clone(), InspectedEntry { size: entry.size })).collect::<Vec<_>>()
+            })
+            .collect();
+        Inspected { values, recency: self.entries.by_use() }
+    }
+
     /// A store that keeps at most `max_bytes` of entries (as [`CacheSize`] and
     /// [`PER_ENTRY_OVERHEAD`] count them).
     pub fn new(max_bytes: usize) -> Arc<Self> {
         Arc::new(Self { max_bytes, entries: Arc::default(), namespace: 0, scope: None })
     }
-
     /// A render snapshot sharing this store's byte budget, isolated from other database versions.
     /// An old in-flight render can populate its own namespace without poisoning the new one.
     pub fn namespace(&self, namespace: u64) -> Arc<Self> {
@@ -181,7 +277,7 @@ impl FragmentCache {
     }
 
     pub fn len(&self) -> usize {
-        self.lock().values.len()
+        self.entries.shards.iter().map(|shard| read_shard(shard).len()).sum()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -190,7 +286,7 @@ impl FragmentCache {
 
     /// The bytes the entries account for.
     pub fn bytes(&self) -> usize {
-        self.lock().bytes
+        self.entries.bytes.load(Ordering::Relaxed)
     }
 
     pub fn max_bytes(&self) -> usize {
@@ -198,57 +294,53 @@ impl FragmentCache {
     }
 
     pub fn clear(&self) {
-        *self.lock() = Entries::default();
+        let _changing = self.entries.changing();
+        for shard in &self.entries.shards {
+            write_shard(shard).clear();
+        }
+        self.entries.bytes.store(0, Ordering::Relaxed);
     }
 
     fn read<T: Clone + 'static>(&self, key: &str) -> Option<T> {
-        let mut entries = self.lock();
-        let Entries { values, recency, clock, .. } = &mut *entries;
-        let entry = values.get_mut(key)?;
+        let entries = &*self.entries;
+        let shard = read_shard(entries.shard(key));
+        let entry = shard.get(key)?;
         let value = entry.value.downcast_ref::<T>()?.clone();
-        *clock += 1;
-        entry.touch(recency, *clock);
+        entry.touch(entries.clock.load(Ordering::Relaxed));
         Some(value)
     }
 
     /// Stores `value` unless `key` already holds one of its type, and returns what `key` holds.
     fn write<T: Clone + Send + Sync + 'static>(&self, key: &str, value: T, size: usize) -> T {
-        let mut entries = self.lock();
-        let Entries { values, recency, clock, bytes } = &mut *entries;
-        *clock += 1;
-        if let Some(entry) = values.get_mut(key) {
-            if let Some(stored) = entry.value.downcast_ref::<T>() {
-                let stored = stored.clone();
-                entry.touch(recency, *clock);
-                return stored;
-            }
-            if let Some(replaced) = values.remove(key) {
-                recency.remove(&replaced.used);
-                *bytes -= replaced.size;
+        let entries = &*self.entries;
+        let _changing = entries.changing();
+        let now = entries.clock.fetch_add(1, Ordering::Relaxed) + 1;
+        let shard = entries.shard(key);
+        {
+            let mut values = write_shard(shard);
+            if let Some(entry) = values.get(key) {
+                if let Some(stored) = entry.value.downcast_ref::<T>() {
+                    let stored = stored.clone();
+                    entry.touch(now);
+                    return stored;
+                }
+                if let Some(replaced) = values.remove(key) {
+                    entries.bytes.fetch_sub(replaced.size, Ordering::Relaxed);
+                }
             }
         }
         if size > self.max_bytes / 4 {
             return value;
         }
-        let key: Arc<str> = key.into();
-        values.insert(key.clone(), Entry { key: key.clone(), value: Arc::new(value.clone()), used: *clock, size });
-        recency.insert(*clock, key);
-        *bytes += size;
-        if *bytes > self.max_bytes {
-            // `MemoryStore#prune(@max_size * 0.75)`
-            let target = self.max_bytes / 4 * 3;
-            while *bytes > target {
-                let Some((_, oldest)) = recency.pop_first() else { break };
-                if let Some(entry) = values.remove(&oldest) {
-                    *bytes -= entry.size;
-                }
-            }
+        if entries.bytes.load(Ordering::Relaxed) + size > self.max_bytes {
+            // `MemoryStore#prune(@max_size * 0.75)`, made before storing rather than after, so
+            // that the entries never take more than the limit, even for a moment.
+            entries.prune((self.max_bytes / 4 * 3).saturating_sub(size));
         }
+        let key: Arc<str> = key.into();
+        write_shard(shard).insert(key, Entry { value: Arc::new(value.clone()), used: AtomicU64::new(now), size });
+        entries.bytes.fetch_add(size, Ordering::Relaxed);
         value
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, Entries> {
-        self.entries.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 

@@ -520,6 +520,7 @@ dependencies = [
  "askama",
  "campfire_routes",
  "crc32fast",
+ "foldhash",
  "html5ever",
  "jiff",
  "rails_compat",

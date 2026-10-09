@@ -247,11 +247,26 @@ impl Message {
 
     // Creating, updating, destroying
 
-    /// `room.messages.create!` (or `create_with_attachment!` given a blob). Inside the
-    /// transaction: the message, its body (which touches the message), its attachment, and
-    /// the room touch. After commit: the search index, then `room.receive` (unread
-    /// memberships and the push job).
+    /// `room.messages.create!` (or `create_with_attachment!` given a blob), in one transaction:
+    /// the message, its body (which touches the message), its attachment, the room touch, the
+    /// search index and `room.receive`'s unread memberships, so that a message is never
+    /// committed without them. The push job follows the commit. Rails' reference indexes and
+    /// marks unread after commit, in commits of their own; current Rails does them in the
+    /// creating transaction too.
     pub fn create(tx: &mut Tx<'_>, attributes: NewMessage) -> Result<Self> {
+        Self::create_prepared(tx, attributes, None)
+    }
+
+    /// [`Message::create`] given the body's plain text, which a caller can compute ahead of the
+    /// write for a body without attachments (only attachments read records), keeping that work
+    /// off the writer. `None` computes it here.
+    pub fn create_prepared(tx: &mut Tx<'_>, attributes: NewMessage, plain_text: Option<String>) -> Result<Self> {
+        // Before any statement, so that the transaction's statements run back to back.
+        let body_text = match (plain_text, &attributes.body) {
+            (Some(text), _) => text,
+            (None, Some(body)) => tx.rich_text().to_plain_text(tx.conn(), body),
+            (None, None) => String::new(),
+        };
         let now = tx.now();
         let client_message_id = attributes.client_message_id.unwrap_or_else(sql::uuid);
         let id: i64 = tx.conn().query_row_cached(
@@ -282,11 +297,16 @@ impl Message {
         }
         Room::touch(tx, message.room_id)?;
 
-        let committed = message.clone();
-        tx.after_commit(move |tx| {
-            committed.create_in_index(tx)?;
-            Room::receive(tx, committed.room_id, &committed)
-        });
+        // `plain_text_body`: the body's text, else the attachment's filename.
+        let index_text = if !body_text.trim().is_empty() {
+            body_text
+        } else if attributes.attachment_blob_id.is_some() {
+            message.attachment(tx.conn())?.map(|(_, blob)| blob.filename).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        tx.conn().execute_cached("insert into message_search_index(rowid, body) values (?, ?)", params![message.id, index_text])?;
+        Room::receive(tx, message.room_id, &message)?;
         Ok(message)
     }
 
@@ -352,12 +372,6 @@ impl Message {
         Room::touch(tx, self.room_id)?;
         let id = self.id;
         tx.after_commit(move |tx| remove_from_index(tx, id));
-        Ok(())
-    }
-
-    fn create_in_index(&self, tx: &Tx<'_>) -> Result<()> {
-        let body = self.plain_text_body(tx.conn(), tx.rich_text())?;
-        tx.conn().execute_cached("insert into message_search_index(rowid, body) values (?, ?)", params![self.id, body])?;
         Ok(())
     }
 

@@ -12,6 +12,7 @@ workspace = true
 askama = { workspace = true, features = ["blocks"] }
 campfire_routes.workspace = true
 crc32fast.workspace = true
+foldhash.workspace = true
 rails_compat.workspace = true
 ruby_compat.workspace = true
 jiff.workspace = true

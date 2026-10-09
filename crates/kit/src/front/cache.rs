@@ -13,7 +13,8 @@
 //! responses while holding their large keys.
 
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, LockResult, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, header};
@@ -49,8 +50,28 @@ impl CachedResponse {
 }
 
 /// `MemoryCache`: a size-bounded map that evicts by sampling.
+///
+/// Lookups share a read lock. A hit records its access time in the entry, an atomic in whole
+/// milliseconds since the cache was made, and only when the time moved on: sampling eviction
+/// needs no finer recency, and hits on a hot entry in the same millisecond then don't all write
+/// to it.
 pub struct MemoryCache {
-    inner: Mutex<Inner>,
+    epoch: Instant,
+    inner: Shared,
+}
+
+/// The cache's state under a read-write lock: shared by lookups (`read`), exclusive for changes
+/// (`lock`).
+struct Shared(RwLock<Inner>);
+
+impl Shared {
+    fn read(&self) -> LockResult<RwLockReadGuard<'_, Inner>> {
+        self.0.read()
+    }
+
+    fn lock(&self) -> LockResult<RwLockWriteGuard<'_, Inner>> {
+        self.0.write()
+    }
 }
 
 struct Inner {
@@ -63,7 +84,8 @@ struct Inner {
 }
 
 struct Entry {
-    last_accessed_at: Instant,
+    /// Milliseconds since [`MemoryCache::epoch`].
+    last_accessed_at: AtomicU64,
     expires_at: Instant,
     value: Arc<CachedResponse>,
     size: i64,
@@ -71,22 +93,30 @@ struct Entry {
 
 impl MemoryCache {
     pub fn new(capacity: i64, max_item_size: i64) -> Self {
-        Self { inner: Mutex::new(Inner { capacity, max_item_size, size: 0, keys: Vec::new(), items: HashMap::new() }) }
+        Self {
+            epoch: Instant::now(),
+            inner: Shared(RwLock::new(Inner { capacity, max_item_size, size: 0, keys: Vec::new(), items: HashMap::new() })),
+        }
     }
 
     pub fn get(&self, key: &str, now: Instant) -> Option<Arc<CachedResponse>> {
-        let mut inner = self.inner.lock().unwrap();
-        let item = inner.items.get_mut(key)?;
+        let accessed_at = self.millis(now);
+        let inner = self.inner.read().unwrap();
+        let item = inner.items.get(key)?;
         if item.expires_at < now {
             return None;
         }
-        item.last_accessed_at = now;
+        // `fetch_max`, so a hit that read the clock earlier never moves the time back.
+        if item.last_accessed_at.load(Ordering::Relaxed) < accessed_at {
+            item.last_accessed_at.fetch_max(accessed_at, Ordering::Relaxed);
+        }
         Some(item.value.clone())
     }
 
     pub fn set(&self, key: String, value: CachedResponse, expires_at: Instant, now: Instant) {
-        let mut inner = self.inner.lock().unwrap();
         let item_size = value.size(&key) as i64;
+        let entry = Entry { last_accessed_at: AtomicU64::new(self.millis(now)), expires_at, value: Arc::new(value), size: item_size };
+        let mut inner = self.inner.lock().unwrap();
         if item_size > inner.max_item_size || item_size > inner.capacity {
             tracing::debug!(len = item_size, "Cache: item is too large to store");
             return;
@@ -100,8 +130,13 @@ impl MemoryCache {
             Some(existing) => inner.size -= existing.size,
             None => inner.keys.push(key.clone()),
         }
-        inner.items.insert(key, Entry { last_accessed_at: now, expires_at, value: Arc::new(value), size: item_size });
+        inner.items.insert(key, entry);
         inner.size += item_size;
+    }
+
+    /// `now` in whole milliseconds since the cache was made (zero for an earlier `now`).
+    fn millis(&self, now: Instant) -> u64 {
+        now.saturating_duration_since(self.epoch).as_millis() as u64
     }
 
     #[cfg(test)]
@@ -114,16 +149,17 @@ impl Inner {
     /// Samples 5 random items and evicts the least recently used, or the first expired one found.
     fn evict_oldest_item(&mut self, now: Instant) {
         let mut rng = rand::rng();
-        let mut oldest: Option<(usize, Instant)> = None;
+        let mut oldest: Option<(usize, u64)> = None;
         for _ in 0..5 {
             let index = rng.random_range(0..self.keys.len());
             let item = &self.items[&self.keys[index]];
+            let accessed_at = item.last_accessed_at.load(Ordering::Relaxed);
             if item.expires_at < now {
-                oldest = Some((index, item.last_accessed_at));
+                oldest = Some((index, accessed_at));
                 break;
             }
-            if oldest.is_none_or(|(_, at)| item.last_accessed_at < at) {
-                oldest = Some((index, item.last_accessed_at));
+            if oldest.is_none_or(|(_, at)| accessed_at < at) {
+                oldest = Some((index, accessed_at));
             }
         }
         let (index, _) = oldest.expect("sampled at least one key");
