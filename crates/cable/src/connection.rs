@@ -1,17 +1,16 @@
 //! `ActionCable::Connection::Base` and `Connection::Subscriptions`: one task per socket.
 //!
 //! Commands are handled one at a time in arrival order. The connection reads its streams straight
-//! from the hub's per-broadcasting ring buffers, so there's no per-connection queue: a client
-//! that stops reading falls behind by the ring's capacity, which closes the connection with
-//! `reconnect: true`. Frames that are ready together go out in one socket write.
+//! from the hub's lanes through cursors, so there's no per-connection queue: a client that stops
+//! reading falls behind by the lane's limits, which closes the connection with `reconnect: true`.
+//! One bell wakes the connection for all of its streams, heartbeats and restarts. Frames that are
+//! ready together go out in one socket write.
 //!
 //! The socket's read half lives in a task of its own that hands incoming messages over in order,
 //! so it's only polled when the socket is readable, not every time a delivery wakes the
 //! connection.
 use std::sync::Arc;
 
-use futures_util::stream::{AbortRegistration, Abortable, SelectAll};
-use futures_util::{FutureExt, StreamExt};
 use rails_compat::json;
 use serde_json::Value;
 use tokio::io::{ReadHalf, WriteHalf};
@@ -19,11 +18,11 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::Server;
-use crate::channel::{Channel, Params, Subscription};
+use crate::channel::{Channel, Params, Stopped, Subscription};
 use crate::protocol::{self, DisconnectReason};
-use crate::pubsub::{Deliveries, Frame, Subscriber};
 use crate::server::{ConnectRequest, Identified, internal_channel};
 use crate::socket::{Incoming, ReadError, Reader, Writer};
+use campfire_bus::{Bell, Cursor, Frame, Peeked};
 
 struct Entry<U: Send + Sync + 'static> {
     channel: Box<dyn Channel<U>>,
@@ -50,7 +49,13 @@ struct Connection<U: Send + Sync + 'static> {
     subscriptions: Vec<Entry<U>>,
     pending: Vec<Frame>,
     /// Streams the last command's callbacks started, to read from once its frames are queued.
-    started: Vec<(Subscriber, AbortRegistration)>,
+    started: Vec<(Cursor, Stopped)>,
+    /// The streams being read, in the order they started.
+    streams: Vec<(Cursor, Stopped)>,
+    /// Where the next flush starts reading the streams.
+    first_stream: usize,
+    bell: Arc<Bell>,
+    shard: usize,
 }
 
 /// The most subscriptions one connection may hold, and the longest identifier it may subscribe with.
@@ -67,11 +72,18 @@ type Sink = Writer<WriteHalf<Io>>;
 /// What the reader task hands the connection: each message, then why it stopped.
 type Received = mpsc::Receiver<Result<Incoming, ReadError>>;
 
-pub(crate) async fn run<U: Identified + Send + Sync + 'static>(server: Server<U>, io: Io, deflate: bool, request: ConnectRequest) {
+pub(crate) async fn run<U: Identified + Send + Sync + 'static>(
+    server: Server<U>,
+    io: Io,
+    deflate: bool,
+    request: ConnectRequest,
+    shard: usize,
+) {
     let (read, write) = tokio::io::split(io);
     let mut sink = Writer::new(write, deflate);
     let (reader, mut incoming) = spawn_reader(Reader::new(read, deflate));
     let config = server.config().clone();
+    let bell = Arc::new(Bell::default());
 
     // handle_open: connect, subscribe to the internal channel, welcome, then process whatever
     // arrived meanwhile (the socket buffers it for us, like MessageBuffer).
@@ -80,10 +92,10 @@ pub(crate) async fn run<U: Identified + Send + Sync + 'static>(server: Server<U>
     };
 
     // The internal channel carries raw payloads; every subscription stream carries frames.
-    let mut internal = SelectAll::new();
     let identifier = user.connection_identifier();
+    let mut internal = None;
     if !identifier.is_empty() {
-        internal.push(server.hub().subscribe(&internal_channel(&identifier), None).deliveries());
+        internal = Some(server.hub().subscribe(&internal_channel(&identifier), None, &bell, shard));
         // A ban or sign-out that disconnected this user between the check above and that
         // subscription went unheard, so check again now that it would be heard (Rails has this
         // gap).
@@ -94,13 +106,21 @@ pub(crate) async fn run<U: Identified + Send + Sync + 'static>(server: Server<U>
     // Only connecting needs the request. Its header values are slices of the HTTP read buffer, so
     // keeping it would hold that buffer (8 KB) for as long as the socket is open.
     drop(request);
-    let mut deliveries = SelectAll::<Deliveries>::new();
 
-    let mut heartbeat = server.heartbeat();
-    heartbeat.mark_unchanged();
-    let mut restarts = server.restarts();
+    let _registration = server.hub().register(&bell, shard);
+    let (mut beats, restarts) = (server.beats(), server.restarts());
 
-    let mut connection = Connection { server, user: Arc::new(user), subscriptions: Vec::new(), pending: Vec::new(), started: Vec::new() };
+    let mut connection = Connection {
+        server,
+        user: Arc::new(user),
+        subscriptions: Vec::new(),
+        pending: Vec::new(),
+        started: Vec::new(),
+        streams: Vec::new(),
+        first_stream: 0,
+        bell,
+        shard,
+    };
 
     let mut close: Option<Close> = None;
     if sink.send(&[protocol::welcome().into()]).await.is_err() {
@@ -110,7 +130,9 @@ pub(crate) async fn run<U: Identified + Send + Sync + 'static>(server: Server<U>
     }
 
     loop {
+        let bell = connection.bell.clone();
         tokio::select! {
+            biased;
             message = incoming.recv() => match message {
                 Some(Ok(Incoming::Text(text))) => connection.dispatch(&text).await,
                 Some(Ok(Incoming::Binary)) => tracing::error!("Couldn't handle non-string message: Array"),
@@ -131,53 +153,62 @@ pub(crate) async fn run<U: Identified + Send + Sync + 'static>(server: Server<U>
                 }
                 Some(Err(ReadError::Io(_))) | None => break,
             },
-            Some(delivery) = deliveries.next() => {
-                // Whatever else is ready already goes out in the same write.
-                let mut delivery = Some(delivery);
-                while let Some(result) = delivery.take() {
-                    match result {
-                        Ok(frame) => connection.pending.push(frame),
-                        Err(_) => {
-                            close = Some(Close::lagged());
-                            break;
-                        }
-                    }
-                    if connection.pending.len() < config.max_write_batch {
-                        delivery = deliveries.next().now_or_never().flatten();
-                    }
+            () = bell.wait() => {
+                if connection.server.restarts() != restarts {
+                    close = Some(Close { reason: Some(DisconnectReason::ServerRestart), reconnect: Value::Bool(true) });
                 }
-            }
-            Some(message) = internal.next() => match message {
-                Ok(message) => match process_internal_message(message.as_str()) {
-                    Some(remote) => close = Some(remote),
-                    None => continue,
-                },
-                Err(_) => continue,
-            },
-            Ok(()) = heartbeat.changed() => {
-                // One frame per beat, shared by every connection.
-                let ping = heartbeat.borrow_and_update().clone();
-                connection.pending.push(ping);
-            }
-            Ok(()) = restarts.recv() => {
-                close = Some(Close { reason: Some(DisconnectReason::ServerRestart), reconnect: Value::Bool(true) });
+                if let Some(cursor) = &mut internal {
+                    close = close.or_else(|| read_internal(cursor));
+                }
+                let beat = connection.server.beats();
+                if beat != beats {
+                    beats = beat;
+                    // One frame per beat, shared by every connection.
+                    connection.pending.push(connection.server.ping());
+                }
             }
         }
 
-        deliveries
-            .extend(connection.started.drain(..).map(|(subscriber, registration)| Abortable::new(subscriber.deliveries(), registration)));
-        if !connection.flush(&mut sink).await {
-            break;
+        connection.streams.retain(|(_, stopped)| !stopped.is_stopped());
+        connection.streams.append(&mut connection.started);
+        let read =
+            if close.is_some() { connection.flush(&mut sink, 0).await } else { connection.flush(&mut sink, config.max_write_batch).await };
+        match read {
+            Ok(true) => {}
+            Ok(false) => close = Some(Close::lagged()),
+            Err(error) => {
+                tracing::debug!(%error, "Closing: the write failed");
+                break;
+            }
         }
         if let Some(Close { reason, reconnect }) = close.take() {
             let _ = sink.send(&[protocol::disconnect(reason, &reconnect).into()]).await;
             close_socket(&mut sink, &mut incoming, config.close_timeout).await;
             break;
         }
+        // A full batch left frames behind: carry on after the shard's other connections.
+        if connection.streams.iter().any(|(cursor, _)| cursor.ready()) {
+            connection.bell.set();
+            tokio::task::yield_now().await;
+        }
     }
 
     reader.abort();
     connection.handle_close().await;
+}
+
+/// The internal channel's messages: a remote disconnect closes the connection.
+fn read_internal(cursor: &mut Cursor) -> Option<Close> {
+    let mut close = None;
+    loop {
+        let mut messages = Vec::new();
+        let Ok(peeked) = cursor.peek(64, &mut messages) else { return close };
+        if peeked.frames == 0 {
+            return close;
+        }
+        close = close.or_else(|| messages.iter().find_map(|message| process_internal_message(message.as_str())));
+        cursor.advance(peeked);
+    }
 }
 
 /// `InternalChannel#process_internal_message`.
@@ -231,14 +262,66 @@ async fn close_socket(sink: &mut Sink, incoming: &mut Received, timeout: std::ti
 }
 
 impl<U: Send + Sync + 'static> Connection<U> {
-    /// Writes the pending frames in order, in one vectored write where the socket takes it.
-    async fn flush(&mut self, sink: &mut Sink) -> bool {
-        if self.pending.is_empty() {
-            return true;
+    /// Writes the pending frames, then up to `max` frames that are ready on the streams, in order,
+    /// in one vectored write where the socket takes it. `Ok(false)` when a stream has lagged.
+    async fn flush(&mut self, sink: &mut Sink, max: usize) -> std::io::Result<bool> {
+        let mut frames: Vec<&Frame> = self.pending.iter().collect();
+        let mut peeked: Vec<(usize, Peeked)> = Vec::with_capacity(self.streams.len());
+        let mut budget = max.saturating_sub(self.pending.len());
+        let mut lagged = false;
+        // Each flush starts at the next stream, so a busy stream can't take every flush's budget
+        // and leave the others to fall behind.
+        let count = self.streams.len();
+        let first = if count == 0 { 0 } else { self.first_stream % count };
+        self.first_stream = self.first_stream.wrapping_add(1);
+        for index in (0..count).map(|i| (first + i) % count) {
+            let (cursor, stopped) = &self.streams[index];
+            let read = if budget == 0 || stopped.is_stopped() { Ok(Peeked::default()) } else { cursor.peek(budget, &mut frames) };
+            match read {
+                Ok(read) => {
+                    budget -= read.frames;
+                    peeked.push((index, read));
+                }
+                Err(_) => {
+                    tracing::debug!(broadcasting = cursor.broadcasting(), "Stream lagged");
+                    lagged = true;
+                    break;
+                }
+            }
         }
-        let written = sink.send(&self.pending).await.is_ok();
+        if lagged {
+            frames.truncate(self.pending.len());
+            peeked.clear();
+        }
+        if !frames.is_empty() {
+            // A publisher that marks one of the streams lagged cancels the write: the socket
+            // closes, and a client that stopped reading keeps no more than the lane's capacity.
+            let bell = &self.bell;
+            let streams = &self.streams;
+            let mut rung = false;
+            let lag = async {
+                loop {
+                    bell.wait().await;
+                    if streams.iter().any(|(cursor, _)| cursor.lagged()) {
+                        return;
+                    }
+                    rung = true;
+                }
+            };
+            tokio::select! {
+                biased;
+                written = sink.send(frames) => written?,
+                () = lag => return Err(std::io::Error::other("a stream lagged during the write")),
+            }
+            if rung {
+                self.bell.set();
+            }
+        }
         self.pending.clear();
-        written
+        for (index, read) in peeked {
+            self.streams[index].0.advance(read);
+        }
+        Ok(!lagged)
     }
 
     /// `Subscriptions#execute_command`. Anything malformed raises in Rails, which is logged and
@@ -289,6 +372,8 @@ impl<U: Send + Sync + 'static> Connection<U> {
             unsubscribed: false,
             transmissions: Vec::new(),
             started: Vec::new(),
+            bell: self.bell.clone(),
+            shard: self.shard,
         };
         self.subscriptions.push(Entry { channel, sub });
         self.subscribe_to_channel(identifier).await;

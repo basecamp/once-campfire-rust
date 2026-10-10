@@ -13,7 +13,6 @@
 //! Action Cable's websocket-driver would close it with.
 
 use std::io::{self, IoSlice};
-use std::sync::{Arc, OnceLock};
 
 use axum::http::{HeaderMap, HeaderValue, header};
 use base64::Engine;
@@ -44,53 +43,11 @@ const OP_PONG: u8 = 0xA;
 // --- Frames ------------------------------------------------------------------------------------
 
 /// A text frame's payload, shared by every connection that sends it and compressed at most once.
-#[derive(Clone)]
-pub struct Frame(Arc<Payload>);
+pub use campfire_bus::Frame;
 
-struct Payload {
-    text: Box<str>,
-    deflated: OnceLock<Box<[u8]>>,
-}
-
-impl Frame {
-    pub fn as_str(&self) -> &str {
-        &self.0.text
-    }
-
-    /// The payload for a socket with compression on: `Some(deflated)` when compressing is worth it.
-    fn deflated(&self) -> Option<&[u8]> {
-        (self.0.text.len() >= MIN_COMPRESSED).then(|| &**self.0.deflated.get_or_init(|| deflate(self.0.text.as_bytes())))
-    }
-}
-
-impl From<String> for Frame {
-    fn from(text: String) -> Self {
-        Frame(Arc::new(Payload { text: text.into_boxed_str(), deflated: OnceLock::new() }))
-    }
-}
-
-impl From<&str> for Frame {
-    fn from(text: &str) -> Self {
-        text.to_string().into()
-    }
-}
-
-impl std::fmt::Debug for Frame {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("Frame").field(&self.as_str()).finish()
-    }
-}
-
-impl PartialEq for Frame {
-    fn eq(&self, other: &Self) -> bool {
-        self.as_str() == other.as_str()
-    }
-}
-
-impl PartialEq<&str> for Frame {
-    fn eq(&self, other: &&str) -> bool {
-        self.as_str() == *other
-    }
+/// The payload for a socket with compression on: `Some(deflated)` when compressing is worth it.
+fn deflated(frame: &Frame) -> Option<&[u8]> {
+    (frame.len() >= MIN_COMPRESSED).then(|| frame.encoded(|text| deflate(text.as_bytes())))
 }
 
 /// Raw deflate at level 6, sync-flushed, without the trailing empty block's 4 bytes.
@@ -391,17 +348,17 @@ impl<W: AsyncWrite + Unpin> Writer<W> {
     }
 
     /// Writes `frames` as text messages, in order, in as few writes as the socket takes.
-    pub async fn send(&mut self, frames: &[Frame]) -> io::Result<()> {
+    pub async fn send<'a>(&mut self, frames: impl IntoIterator<Item = &'a Frame>) -> io::Result<()> {
         let payloads: Vec<(bool, &[u8])> = frames
-            .iter()
-            .map(|frame| match self.deflate.then(|| frame.deflated()).flatten() {
+            .into_iter()
+            .map(|frame| match self.deflate.then(|| deflated(frame)).flatten() {
                 Some(deflated) => (true, deflated),
                 None => (false, frame.as_str().as_bytes()),
             })
             .collect();
         let headers: Vec<([u8; 10], usize)> =
             payloads.iter().map(|(compressed, payload)| header(OP_TEXT, *compressed, payload.len())).collect();
-        let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(frames.len() * 2);
+        let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(payloads.len() * 2);
         for ((header, len), (_, payload)) in headers.iter().zip(&payloads) {
             slices.push(IoSlice::new(&header[..*len]));
             slices.push(IoSlice::new(payload));
@@ -624,9 +581,9 @@ mod tests {
             }
             assert_eq!(texts, vec![(false, small.as_str().to_string()), (deflate, big.as_str().to_string())]);
         }
-        let compressed = big.deflated().unwrap();
+        let compressed = super::deflated(&big).unwrap();
         assert!(compressed.len() < big.as_str().len() / 10, "{} bytes", compressed.len());
-        assert!(std::ptr::eq(compressed, big.clone().deflated().unwrap()), "compressed once, shared by clones");
+        assert!(std::ptr::eq(compressed, super::deflated(&big.clone()).unwrap()), "compressed once, shared by clones");
     }
 
     fn handshake(extensions: &[&str]) -> Option<Handshake> {

@@ -68,6 +68,7 @@ pub async fn create(c: &mut Ctx) -> Result {
     let attributes = message_params(c)?;
     let message = create_message(c, &room, attributes).await?;
     broadcast_create(c, &room, &message).await?;
+    c.app().broadcasts.settle_messages(&room).await;
     deliver_webhooks_to_bots(c, &room, &message).await?;
 
     // The message partial comes out of the fragment cache `broadcast_create` just filled

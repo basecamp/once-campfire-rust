@@ -390,12 +390,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "campfire_bus"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "campfire_cable"
 version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
  "base64 0.22.1",
+ "campfire_bus",
  "flate2",
  "futures-util",
  "hyper",
