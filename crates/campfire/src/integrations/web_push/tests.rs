@@ -165,7 +165,9 @@ fn config(public_key: Option<&str>, private_key: Option<&str>) -> crate::config:
 #[tokio::test(flavor = "multi_thread")]
 async fn web_push_is_off_without_a_valid_key_pair() {
     let t = tokio::task::spawn_blocking(TestDb::new).await.unwrap();
-    let pool = |public_key, private_key| crate::integrations::web_push_pool(&config(public_key, private_key), &t.db);
+    let pool = |public_key, private_key| {
+        crate::integrations::web_push_pool(&config(public_key, private_key), &t.db, Arc::new(campfire_jobs::Backlog::new(10_000)))
+    };
     assert!(pool(None, Some(VAPID_PRIVATE_KEY)).is_none());
     assert!(pool(Some("dGVzdF9rZXk"), Some(VAPID_PRIVATE_KEY)).is_none());
     assert!(pool(Some(VAPID_PUBLIC_KEY), Some(VAPID_PRIVATE_KEY)).is_some());
@@ -386,7 +388,7 @@ async fn the_pool_keeps_subscriptions_it_failed_to_reach() {
 }
 
 #[tokio::test]
-async fn the_pool_drops_deliveries_past_its_queue() {
+async fn the_pool_keeps_deliveries_past_rails_queue_limit() {
     let service = push_service(201, "Created").await;
     let pool = Pool::new(service.net.clone(), vapid(), |_| -> Result<(), String> { Ok(()) });
     let receiver = Receiver::new();
@@ -394,7 +396,7 @@ async fn the_pool_drops_deliveries_past_its_queue() {
     for _ in 0..(50 + 10_000 + 5) {
         pool.deliver_later(notification(subscription.clone()));
     }
-    assert_eq!(pool.pending(), 10_050);
+    assert_eq!(pool.pending(), 10_055, "Rails drops the last five; the lane keeps them");
 }
 
 /// A delivery that panics still gives its place in the queue back, so panics can't fill it up.

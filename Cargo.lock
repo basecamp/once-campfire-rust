@@ -338,6 +338,7 @@ dependencies = [
  "campfire_assets",
  "campfire_cable",
  "campfire_db",
+ "campfire_jobs",
  "campfire_kit",
  "campfire_richtext",
  "campfire_routes",
@@ -439,6 +440,13 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "campfire_jobs"
+version = "0.1.0"
+dependencies = [
+ "tokio",
 ]
 
 [[package]]

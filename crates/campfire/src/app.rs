@@ -149,7 +149,7 @@ pub async fn boot(config: Config) -> anyhow::Result<Booted> {
 
     let fragment_cache = FragmentCache::new(config.fragment_cache_bytes);
     let response_cache = crate::response_cache::Store::open(db.path(), config.response_cache_bytes)?;
-    let web_push = crate::integrations::web_push_pool(&config, &db);
+    let web_push = crate::integrations::web_push_pool(&config, &db, jobs.backlog().clone());
     let app = Arc::new(AppState {
         config,
         secrets,
@@ -196,8 +196,12 @@ fn router(app: &App, kit: Kit) -> Router {
         .layer(axum::middleware::from_fn(crate::response_cache::completed))
 }
 
-/// The Rails route table, with the app's fragment cache current while the action runs.
+/// The Rails route table, with the app's fragment cache current while the action runs. A request
+/// that can write waits first while the job backlog is over its mark (see `campfire_jobs::Backlog`).
 async fn dispatch_with_fragment_cache(c: &mut Ctx) -> campfire_kit::Result {
+    if !matches!(c.request.method, axum::http::Method::GET | axum::http::Method::HEAD) {
+        c.app().jobs.backlog().admit().await;
+    }
     let snapshot = crate::response_cache::Snapshot::capture(c);
     c.set_current(snapshot);
     let cache = crate::response_cache::fragments(c);
