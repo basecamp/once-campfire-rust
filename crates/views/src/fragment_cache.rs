@@ -22,11 +22,12 @@
 
 use std::any::Any;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
 
 /// A rendered fragment as the store keeps it.
@@ -83,9 +84,14 @@ fn fitted(mut html: String) -> String {
 }
 
 /// A byte-bounded in-process fragment store.
+///
+/// Reads share the lock: each one stamps its entry from `clock` without taking the lock
+/// exclusively, because a room page reads dozens of fragments per request on every worker. Writes
+/// hold the lock exclusively, and an eviction orders the entries by their stamps.
 pub struct FragmentCache {
     max_bytes: usize,
-    entries: Arc<Mutex<Entries>>,
+    clock: Arc<AtomicU64>,
+    entries: Arc<RwLock<Entries>>,
     namespace: u64,
     scope: Option<Arc<str>>,
 }
@@ -93,47 +99,40 @@ pub struct FragmentCache {
 #[derive(Default)]
 struct Entries {
     values: HashMap<Arc<str>, Entry>,
-    /// Last use → key, oldest first.
-    recency: BTreeMap<u64, Arc<str>>,
-    clock: u64,
     /// The sum of every entry's `size`.
     bytes: usize,
 }
 
 struct Entry {
-    /// The map's key, shared with `recency`.
-    key: Arc<str>,
     value: Value,
-    used: u64,
+    /// The `clock` value of the last use.
+    used: AtomicU64,
     size: usize,
-}
-
-impl Entry {
-    /// Marks the entry used at `now`.
-    fn touch(&mut self, recency: &mut BTreeMap<u64, Arc<str>>, now: u64) {
-        recency.remove(&self.used);
-        self.used = now;
-        recency.insert(now, self.key.clone());
-    }
 }
 
 impl FragmentCache {
     /// A store that keeps at most `max_bytes` of entries (as [`CacheSize`] and
     /// [`PER_ENTRY_OVERHEAD`] count them).
     pub fn new(max_bytes: usize) -> Arc<Self> {
-        Arc::new(Self { max_bytes, entries: Arc::default(), namespace: 0, scope: None })
+        Arc::new(Self { max_bytes, clock: Arc::default(), entries: Arc::default(), namespace: 0, scope: None })
     }
 
     /// A render snapshot sharing this store's byte budget, isolated from other database versions.
     /// An old in-flight render can populate its own namespace without poisoning the new one.
     pub fn namespace(&self, namespace: u64) -> Arc<Self> {
-        Arc::new(Self { max_bytes: self.max_bytes, entries: self.entries.clone(), namespace, scope: None })
+        Arc::new(Self { max_bytes: self.max_bytes, clock: self.clock.clone(), entries: self.entries.clone(), namespace, scope: None })
     }
 
     /// Isolates fragments whose rendering depends on an origin or another explicit context.
     /// The backing store and memory budget remain shared with every other scope.
     pub fn scoped(&self, scope: impl Into<Arc<str>>) -> Arc<Self> {
-        Arc::new(Self { max_bytes: self.max_bytes, entries: self.entries.clone(), namespace: self.namespace, scope: Some(scope.into()) })
+        Arc::new(Self {
+            max_bytes: self.max_bytes,
+            clock: self.clock.clone(),
+            entries: self.entries.clone(),
+            namespace: self.namespace,
+            scope: Some(scope.into()),
+        })
     }
 
     fn scoped_key<'a>(&self, key: &'a str) -> std::borrow::Cow<'a, str> {
@@ -181,7 +180,7 @@ impl FragmentCache {
     }
 
     pub fn len(&self) -> usize {
-        self.lock().values.len()
+        self.shared().values.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -190,7 +189,7 @@ impl FragmentCache {
 
     /// The bytes the entries account for.
     pub fn bytes(&self) -> usize {
-        self.lock().bytes
+        self.shared().bytes
     }
 
     pub fn max_bytes(&self) -> usize {
@@ -198,47 +197,51 @@ impl FragmentCache {
     }
 
     pub fn clear(&self) {
-        *self.lock() = Entries::default();
+        *self.exclusive() = Entries::default();
+    }
+
+    fn tick(&self) -> u64 {
+        self.clock.fetch_add(1, Ordering::Relaxed) + 1
     }
 
     fn read<T: Clone + 'static>(&self, key: &str) -> Option<T> {
-        let mut entries = self.lock();
-        let Entries { values, recency, clock, .. } = &mut *entries;
-        let entry = values.get_mut(key)?;
+        let entries = self.shared();
+        let entry = entries.values.get(key)?;
         let value = entry.value.downcast_ref::<T>()?.clone();
-        *clock += 1;
-        entry.touch(recency, *clock);
+        entry.used.fetch_max(self.tick(), Ordering::Relaxed);
         Some(value)
     }
 
     /// Stores `value` unless `key` already holds one of its type, and returns what `key` holds.
     fn write<T: Clone + Send + Sync + 'static>(&self, key: &str, value: T, size: usize) -> T {
-        let mut entries = self.lock();
-        let Entries { values, recency, clock, bytes } = &mut *entries;
-        *clock += 1;
-        if let Some(entry) = values.get_mut(key) {
+        let mut entries = self.exclusive();
+        let now = self.tick();
+        let Entries { values, bytes } = &mut *entries;
+        if let Some(entry) = values.get(key) {
             if let Some(stored) = entry.value.downcast_ref::<T>() {
                 let stored = stored.clone();
-                entry.touch(recency, *clock);
+                entry.used.fetch_max(now, Ordering::Relaxed);
                 return stored;
             }
             if let Some(replaced) = values.remove(key) {
-                recency.remove(&replaced.used);
                 *bytes -= replaced.size;
             }
         }
         if size > self.max_bytes / 4 {
             return value;
         }
-        let key: Arc<str> = key.into();
-        values.insert(key.clone(), Entry { key: key.clone(), value: Arc::new(value.clone()), used: *clock, size });
-        recency.insert(*clock, key);
+        values.insert(key.into(), Entry { value: Arc::new(value.clone()), used: AtomicU64::new(now), size });
         *bytes += size;
         if *bytes > self.max_bytes {
-            // `MemoryStore#prune(@max_size * 0.75)`
+            // `MemoryStore#prune(@max_size * 0.75)`: least recently used first.
             let target = self.max_bytes / 4 * 3;
-            while *bytes > target {
-                let Some((_, oldest)) = recency.pop_first() else { break };
+            let mut by_use: Vec<(u64, Arc<str>)> =
+                values.iter().map(|(key, entry)| (entry.used.load(Ordering::Relaxed), key.clone())).collect();
+            by_use.sort_unstable_by_key(|(used, _)| *used);
+            for (_, oldest) in by_use {
+                if *bytes <= target {
+                    break;
+                }
                 if let Some(entry) = values.remove(&oldest) {
                     *bytes -= entry.size;
                 }
@@ -247,8 +250,12 @@ impl FragmentCache {
         value
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Entries> {
-        self.entries.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    fn shared(&self) -> std::sync::RwLockReadGuard<'_, Entries> {
+        self.entries.read().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn exclusive(&self) -> std::sync::RwLockWriteGuard<'_, Entries> {
+        self.entries.write().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -655,8 +662,7 @@ mod tests {
         });
         let len = cache.len();
         assert!(len > 0 && cache.bytes() <= max);
-        assert_eq!(cache.bytes(), cache.lock().values.values().map(|entry| entry.size).sum::<usize>());
-        assert_eq!(cache.lock().recency.len(), len, "every entry is in the recency order once");
+        assert_eq!(cache.bytes(), cache.shared().values.values().map(|entry| entry.size).sum::<usize>());
     }
 
     #[test]

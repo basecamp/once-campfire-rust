@@ -43,7 +43,7 @@ async fn push_message(app: App, event: Event) -> anyhow::Result<()> {
 /// subscription handler destroys the subscription (`Push::Subscription.find_by(id:)&.destroy`).
 /// `None`, and Web Push is off, when the VAPID keys are missing or invalid. Call from inside the
 /// runtime.
-pub fn web_push_pool(config: &Config, db: &Database) -> Option<web_push::Pool> {
+pub fn web_push_pool(config: &Config, db: &Database, backlog: std::sync::Arc<campfire_jobs::Backlog>) -> Option<web_push::Pool> {
     let vapid = match VapidConfig::from_config(config) {
         Ok(vapid) => vapid,
         Err(error @ VapidError::Missing) => {
@@ -56,13 +56,14 @@ pub fn web_push_pool(config: &Config, db: &Database) -> Option<web_push::Pool> {
         }
     };
     let db = db.clone();
-    Some(web_push::Pool::new(Network::system(), vapid, move |id| {
+    let destroy = move |id| {
         db.write_blocking(move |tx| match PushSubscription::find(tx.conn(), id) {
             Ok(subscription) => subscription.destroy(tx),
             Err(campfire_db::Error::RecordNotFound(_)) => Ok(()),
             Err(error) => Err(error),
         })
-    }))
+    };
+    Some(web_push::Pool::counting(Network::system(), vapid, destroy, backlog))
 }
 
 /// `Bot::WebhookJob#perform(bot, message)`: `bot.deliver_webhook(message)`, i.e.

@@ -240,20 +240,21 @@ impl PageParts {
         let befores: Vec<(Before, &[u8])> =
             std::iter::once((Before::Nothing, &b""[..])).chain(self.parts.iter().map(Part::as_before)).collect();
         // Only look up under the locks; compressing happens outside them.
-        let stored: Vec<Option<Piece>> = {
-            let mut fragments = lock(&FRAGMENTS);
-            let mut texts = lock(&TEXT_PIECES);
-            self.parts
-                .iter()
-                .zip(&befores)
-                .map(|(part, (before, _))| match part {
-                    Part::Text { sha, .. } => texts.get(&(*sha, *before), Piece::clone),
-                    Part::Fragment { fragment, glue, .. } => {
-                        fragments.get(&fragment_key(fragment), |known| known.piece_after(*before, glue)).flatten()
-                    }
-                })
-                .collect()
-        };
+        let stored: Vec<Option<Piece>> = self
+            .parts
+            .iter()
+            .zip(&befores)
+            .map(|(part, (before, _))| match part {
+                Part::Text { sha, .. } => {
+                    let key = (*sha, *before);
+                    TEXT_PIECES.lock_for(&key).get(&key, Piece::clone)
+                }
+                Part::Fragment { fragment, glue, .. } => {
+                    let key = fragment_key(fragment);
+                    FRAGMENTS.lock_for(&key).get(&key, |known| known.piece_after(*before, glue)).flatten()
+                }
+            })
+            .collect();
         let mut pieces = Vec::with_capacity(self.parts.len());
         let mut new_texts = Vec::new();
         let mut new_fragments = Vec::new();
@@ -272,17 +273,12 @@ impl PageParts {
             }
             pieces.push(compressed);
         }
-        if !new_texts.is_empty() {
-            let mut texts = lock(&TEXT_PIECES);
-            for (key, piece) in new_texts {
-                texts.insert(key, piece);
-            }
+        for (key, piece) in new_texts {
+            TEXT_PIECES.lock_for(&key).insert(key, piece);
         }
-        if !new_fragments.is_empty() {
-            let mut fragments = lock(&FRAGMENTS);
-            for (fragment, piece) in new_fragments {
-                fragments.update(&fragment_key(&fragment), |known| known.store(piece));
-            }
+        for (fragment, piece) in new_fragments {
+            let key = fragment_key(&fragment);
+            FRAGMENTS.lock_for(&key).update(&key, |known| known.store(piece));
         }
         pieces
     }
@@ -297,13 +293,13 @@ fn text_part(text: Bytes) -> Part {
 /// one request to the next, and finding one again costs a fast hash and a compare, a small part of
 /// hashing it. The compare is what makes this sound, since the SHA-256 is what stored pieces are
 /// found by: two texts whose fast hashes collide still get their own.
-fn text_sha<S: BuildHasher + Default>(shas: &Mutex<Generations<Box<[u8]>, Sha, S>>, text: &[u8]) -> Sha {
-    if let Some(sha) = lock(shas).get(text, |sha| *sha) {
+fn text_sha<S: BuildHasher + Default>(shas: &Shards<Generations<Box<[u8]>, Sha, S>>, text: &[u8]) -> Sha {
+    if let Some(sha) = shas.lock_for(text).get(text, |sha| *sha) {
         return sha;
     }
     let sha = Sha256::digest(text).into();
     if text.len() <= MAX_STORED_TEXT {
-        lock(shas).insert(text.into(), sha);
+        shas.lock_for(text).insert(text.into(), sha);
     }
     sha
 }
@@ -594,12 +590,36 @@ impl<K: Hash + Eq, V, S: BuildHasher + Default> Generations<K, V, S> {
     }
 }
 
-static FRAGMENTS: LazyLock<Mutex<KnownFragments>> =
-    LazyLock::new(|| Mutex::new(Generations::with_budget(MAX_FRAGMENT_BYTES, |_, known| known.cost())));
-static TEXT_PIECES: LazyLock<Mutex<Generations<(Sha, Before), Piece>>> =
-    LazyLock::new(|| Mutex::new(Generations::with_budget(MAX_TEXT_PIECE_BYTES, |_, piece| piece.deflated.len() + ENTRY_OVERHEAD)));
-static TEXT_SHAS: LazyLock<Mutex<Generations<Box<[u8]>, Sha>>> =
-    LazyLock::new(|| Mutex::new(Generations::with_budget(MAX_TEXT_BYTES, |text, _| text.len() + ENTRY_OVERHEAD)));
+/// Shards of a cache.
+pub(super) const SHARDS: usize = 16;
+
+/// A cache split by key hash into [`SHARDS`] parts, each behind its own lock: a page's parts are
+/// looked up by every request on every core, and one lock for the whole cache made them wait for
+/// each other. Each shard has an equal part of the cache's budget.
+pub(super) struct Shards<T> {
+    shards: Box<[Mutex<T>]>,
+    hasher: RandomState,
+}
+
+impl<T> Shards<T> {
+    pub(super) fn new(make: impl Fn() -> T) -> Self {
+        Self { shards: (0..SHARDS).map(|_| Mutex::new(make())).collect(), hasher: RandomState::default() }
+    }
+
+    /// The shard that holds `key`.
+    pub(super) fn lock_for<K: Hash + ?Sized>(&self, key: &K) -> MutexGuard<'_, T> {
+        lock(&self.shards[self.hasher.hash_one(key) as usize % SHARDS])
+    }
+}
+
+static FRAGMENTS: LazyLock<Shards<KnownFragments>> =
+    LazyLock::new(|| Shards::new(|| Generations::with_budget(MAX_FRAGMENT_BYTES / SHARDS, |_, known: &KnownFragment| known.cost())));
+static TEXT_PIECES: LazyLock<Shards<Generations<(Sha, Before), Piece>>> = LazyLock::new(|| {
+    Shards::new(|| Generations::with_budget(MAX_TEXT_PIECE_BYTES / SHARDS, |_, piece: &Piece| piece.deflated.len() + ENTRY_OVERHEAD))
+});
+static TEXT_SHAS: LazyLock<Shards<Generations<Box<[u8]>, Sha>>> = LazyLock::new(|| {
+    Shards::new(|| Generations::<Box<[u8]>, Sha>::with_budget(MAX_TEXT_BYTES / SHARDS, |text, _| text.len() + ENTRY_OVERHEAD))
+});
 
 pub(super) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -611,8 +631,7 @@ fn fragment_key(fragment: &Arc<String>) -> usize {
 
 /// Each fragment's SHA-256, hashing (and remembering) the ones not seen before.
 fn fragment_shas<'a>(fragments: impl Iterator<Item = &'a Arc<String>>) -> Vec<Sha> {
-    let mut known = lock(&FRAGMENTS);
-    fragments.map(|fragment| known.sha(fragment)).collect()
+    fragments.map(|fragment| FRAGMENTS.lock_for(&fragment_key(fragment)).sha(fragment)).collect()
 }
 
 #[cfg(test)]
@@ -627,7 +646,8 @@ mod tests {
     }
 
     fn stored_pieces(fragment: &Arc<String>) -> Vec<Arc<FragmentPiece>> {
-        lock(&FRAGMENTS).get(&fragment_key(fragment), |known| known.pieces.clone()).expect("a known fragment")
+        let key = fragment_key(fragment);
+        FRAGMENTS.lock_for(&key).get(&key, |known| known.pieces.clone()).expect("a known fragment")
     }
 
     fn message(n: usize) -> Arc<String> {
@@ -905,8 +925,9 @@ mod tests {
         plain.extend_from_slice(fragment.as_bytes());
         assert_eq!(gunzip(&parts.gzip(0)), plain);
         let sha: Sha = Sha256::digest(&text).into();
-        assert!(lock(&TEXT_SHAS).get(&text[..], |_| ()).is_none(), "hashed, not remembered");
-        assert!(lock(&TEXT_PIECES).get(&(sha, Before::Nothing), |_| ()).is_none(), "compressed, not stored");
+        assert!(TEXT_SHAS.lock_for(&text[..]).get(&text[..], |_| ()).is_none(), "hashed, not remembered");
+        let key = (sha, Before::Nothing);
+        assert!(TEXT_PIECES.lock_for(&key).get(&key, |_| ()).is_none(), "compressed, not stored");
     }
 
     #[test]
@@ -936,15 +957,18 @@ mod tests {
     #[test]
     fn a_text_is_known_by_its_bytes_not_its_fast_hash() {
         // A small budget, so texts also age out and come back through the old generation.
-        let shas: Mutex<Generations<Box<[u8]>, Sha, std::hash::BuildHasherDefault<Colliding>>> =
-            Mutex::new(Generations::with_budget(8 * 1024, |text, _| text.len() + ENTRY_OVERHEAD));
+        let shas: Shards<Generations<Box<[u8]>, Sha, std::hash::BuildHasherDefault<Colliding>>> = Shards::new(|| {
+            Generations::<Box<[u8]>, Sha, std::hash::BuildHasherDefault<Colliding>>::with_budget(8 * 1024, |text, _| {
+                text.len() + ENTRY_OVERHEAD
+            })
+        });
         // The same length, all in one bucket.
         let texts: Vec<String> = (0..30).map(|n| format!("<h1>Room {n:02}</h1>").repeat(40)).collect();
         for _ in 0..3 {
             for text in &texts {
                 let sha: Sha = Sha256::digest(text).into();
                 assert_eq!(text_sha(&shas, text.as_bytes()), sha);
-                assert_eq!(lock(&shas).get(text.as_bytes(), |sha| *sha), Some(sha), "remembered as its own");
+                assert_eq!(shas.lock_for(text.as_bytes()).get(text.as_bytes(), |sha| *sha), Some(sha), "remembered as its own");
             }
         }
     }

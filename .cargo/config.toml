@@ -1,0 +1,14 @@
+[env]
+# rusqlite's bundled build defines SQLITE_ENABLE_MEMORY_MANAGEMENT, which puts every connection's
+# pages in one unified page cache behind a process-wide mutex (pcache1 "mode 2"). The reader pool's
+# threads then serialize on that mutex for each b-tree page. Without it, each connection keeps its
+# own page cache. Nothing here calls sqlite3_release_memory or sets a heap limit.
+# SQLITE_DEFAULT_MEMSTATUS=0: sqlite3_malloc otherwise takes a process-wide mutex to count every
+# allocation for sqlite3_status, which nothing here reads.
+# SQLITE_THREADSAFE=2 (multi-thread): each connection is used by one thread at a time (reader
+# threads, the writer thread, the checkpointer), so the connection mutexes of the default
+# serialized mode only cost a lock and an unlock for each API call.
+# SQLITE_OMIT_SHARED_CACHE: no connection here uses shared-cache mode, which otherwise makes each
+# statement step enter and leave a b-tree mutex.
+# SQLITE_USE_ALLOCA: scratch buffers come from the stack, not the allocator.
+LIBSQLITE3_FLAGS = "-USQLITE_ENABLE_MEMORY_MANAGEMENT -DSQLITE_DEFAULT_MEMSTATUS=0 -USQLITE_THREADSAFE -DSQLITE_THREADSAFE=2 -DSQLITE_OMIT_SHARED_CACHE -DSQLITE_USE_ALLOCA"

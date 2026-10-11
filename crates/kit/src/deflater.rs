@@ -4,7 +4,7 @@
 //! chunked (and the front server's compression leaves it alone).
 
 use std::io::Write;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock};
 
 use axum::body::Body;
 use axum::extract::Request;
@@ -19,7 +19,7 @@ use http_body_util::BodyExt;
 
 pub mod splice;
 
-use splice::{ENTRY_OVERHEAD, Generations, lock};
+use splice::{ENTRY_OVERHEAD, Generations, SHARDS, Shards};
 
 /// A response `ActionDispatch::Static` served (a public file or an asset). Marks responses the
 /// middleware below `Static` in the reference (`Rack::Runtime`, `ActionDispatch::RequestId`)
@@ -192,7 +192,7 @@ fn select_best_encoding(available: &[&'static str], accept: &[(String, f64)]) ->
 /// `GzipStream` with `sync: true`: each body chunk is compressed and flushed as it arrives.
 /// `Zlib::GzipWriter` writes the header with the given mtime and the Unix OS code.
 fn gzip_stream(body: Body, mtime: u32) -> Body {
-    let encoder = gzip_encoder(mtime);
+    let encoder = gzip_encoder(mtime, level_for(hyper::body::Body::size_hint(&body).exact()));
     let chunks = body.into_data_stream();
     let stream = futures_util::stream::unfold(Some((chunks, encoder)), |state| async move {
         let (mut chunks, mut encoder) = state?;
@@ -213,14 +213,28 @@ fn gzip_stream(body: Body, mtime: u32) -> Body {
     Body::from_stream(stream)
 }
 
-fn gzip_encoder(mtime: u32) -> GzEncoder<Vec<u8>> {
-    GzBuilder::new().mtime(mtime).operating_system(3).write(Vec::new(), Compression::default())
+fn gzip_encoder(mtime: u32, level: Compression) -> GzEncoder<Vec<u8>> {
+    GzBuilder::new().mtime(mtime).operating_system(3).write(Vec::new(), level)
+}
+
+/// Bodies of a known size up to this are gzipped at level 1.
+const SMALL_BODY: u64 = 16 << 10;
+
+/// The gzip level for a body of `len` bytes: level 1 for a small one, `Zlib`'s default (6) for
+/// the rest and for bodies of unknown size. On a small body, which is mostly unique (a posted
+/// message's turbo stream), level 6's longer match search costs several times level 1's CPU for
+/// output that is at most a few hundred bytes smaller.
+fn level_for(len: Option<u64>) -> Compression {
+    match len {
+        Some(len) if len <= SMALL_BODY => Compression::fast(),
+        _ => Compression::default(),
+    }
 }
 
 /// A body `Rack::ETag` digested (always a single buffer), gzipped once while it keeps repeating.
 async fn gzip_digested(body: Body, digest: BodyDigest, mtime: u32) -> Body {
     let key = (digest, mtime);
-    let cached = lock(&GZIPPED).get(&key, Bytes::clone);
+    let cached = GZIPPED.lock_for(&key).get(&key, Bytes::clone);
     if let Some(gzipped) = cached {
         return single_chunk(gzipped);
     }
@@ -232,7 +246,7 @@ async fn gzip_digested(body: Body, digest: BodyDigest, mtime: u32) -> Body {
         Ok(gzipped) => {
             // One huge body mustn't push out everything else.
             if gzipped.len() <= MAX_GZIPPED_BYTES / 4 {
-                lock(&GZIPPED).insert(key, gzipped.clone());
+                GZIPPED.lock_for(&key).insert(key, gzipped.clone());
             }
             single_chunk(gzipped)
         }
@@ -242,7 +256,7 @@ async fn gzip_digested(body: Body, digest: BodyDigest, mtime: u32) -> Body {
 
 /// What [`gzip_stream`] sends for a single-buffer body, in one piece.
 fn gzip_member(body: &[u8], mtime: u32) -> std::io::Result<Bytes> {
-    let mut encoder = gzip_encoder(mtime);
+    let mut encoder = gzip_encoder(mtime, level_for(Some(body.len() as u64)));
     if !body.is_empty() {
         encoder.write_all(body)?;
         encoder.flush()?;
@@ -265,8 +279,9 @@ fn compress(encoder: &mut GzEncoder<Vec<u8>>, chunk: &[u8]) -> std::io::Result<B
 }
 
 /// Gzip members by body digest and gzip mtime.
-static GZIPPED: LazyLock<Mutex<Generations<(BodyDigest, u32), Bytes>>> =
-    LazyLock::new(|| Mutex::new(Generations::with_budget(MAX_GZIPPED_BYTES, |_, gzipped| gzipped.len() + ENTRY_OVERHEAD)));
+static GZIPPED: LazyLock<Shards<Generations<(BodyDigest, u32), Bytes>>> = LazyLock::new(|| {
+    Shards::new(|| Generations::with_budget(MAX_GZIPPED_BYTES / SHARDS, |_, gzipped: &Bytes| gzipped.len() + ENTRY_OVERHEAD))
+});
 
 #[cfg(test)]
 mod tests {
@@ -342,7 +357,8 @@ mod tests {
         let body = Bytes::from("<a href=\"/rooms/1\">Room</a>".repeat(300));
         let first = gzipped(gzip_digested(Body::from(body.clone()), digest(&body), 0).await).await;
         assert_eq!(first, gzipped(gzip_stream(Body::from(body.clone()), 0)).await, "what gzip_stream sends");
-        let kept = lock(&GZIPPED).get(&(digest(&body), 0), Bytes::clone).expect("kept");
+        let key = (digest(&body), 0);
+        let kept = GZIPPED.lock_for(&key).get(&key, Bytes::clone).expect("kept");
         let again = gzipped(gzip_digested(Body::from(body.clone()), digest(&body), 0).await).await;
         assert_eq!(again.as_ptr(), kept.as_ptr(), "not gzipped again");
 

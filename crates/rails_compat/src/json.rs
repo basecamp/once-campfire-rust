@@ -29,19 +29,29 @@ pub fn encode<T: Serialize + ?Sized>(value: &T) -> String {
 /// Re-escapes already-encoded JSON. `<`, `>` and `&` can only appear inside JSON strings, so
 /// replacing them anywhere in the document is safe, and doing it twice is harmless.
 pub fn escape_html_entities(json: String) -> String {
-    if !json.contains(['<', '>', '&']) {
+    // A broadcast is mostly rendered HTML, with many of the three. They are ASCII, and no byte of a
+    // multi-byte UTF-8 character is ASCII, so a byte-wise replacement into one exact allocation
+    // gives the same string as a character-wise one.
+    let bytes = json.as_bytes();
+    let count = bytes.iter().filter(|&&b| matches!(b, b'<' | b'>' | b'&')).count();
+    if count == 0 {
         return json;
     }
-    let mut escaped = String::with_capacity(json.len() + 16);
-    for c in json.chars() {
-        match c {
-            '<' => escaped.push_str("\\u003c"),
-            '>' => escaped.push_str("\\u003e"),
-            '&' => escaped.push_str("\\u0026"),
-            c => escaped.push(c),
-        }
+    let mut escaped = Vec::with_capacity(bytes.len() + count * 5);
+    let mut start = 0;
+    for (at, &byte) in bytes.iter().enumerate() {
+        let replacement: &[u8] = match byte {
+            b'<' => b"\\u003c",
+            b'>' => b"\\u003e",
+            b'&' => b"\\u0026",
+            _ => continue,
+        };
+        escaped.extend_from_slice(&bytes[start..at]);
+        escaped.extend_from_slice(replacement);
+        start = at + 1;
     }
-    escaped
+    escaped.extend_from_slice(&bytes[start..]);
+    String::from_utf8(escaped).expect("ASCII replacements keep UTF-8 valid")
 }
 
 pub fn parse(bytes: &[u8]) -> Option<Value> {

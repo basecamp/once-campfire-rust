@@ -9,6 +9,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+campfire_bus.workspace = true
 rails_compat.workspace = true
 ruby_compat.workspace = true
 tokio.workspace = true

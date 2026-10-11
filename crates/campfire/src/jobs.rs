@@ -1,12 +1,14 @@
 //! The in-process job runner that replaces Resque (see plans/rust-conversion.md, "Jobs").
 //!
 //! Models emit [`Event`]s at the point Rails would `perform_later` (the database's
-//! [`EventSink`]); [`Jobs`] puts each on its kind's **bounded** queue without blocking the writer
-//! thread, and each kind has its own workers, so a kind that's slow (webhooks to a slow bot) or
-//! full can't hold up the others (pushes, purges). Nothing retries (`retry_on` is commented out
-//! in `reference/app/jobs/application_job.rb`); a failure or panic is logged. Queued work is lost
-//! if the process crashes, which the plan accepts. On shutdown the runner stops taking new work,
-//! performs what's queued and waits for it up to a deadline.
+//! [`EventSink`]); [`Jobs`] puts each on its kind's lane without blocking the writer thread, and
+//! each kind has its own workers, so a kind that's slow (webhooks to a slow bot) can't hold up the
+//! others (pushes, purges). A lane never drops a job, as Resque doesn't. Its bound is the
+//! [`Backlog`]: while too many jobs wait, requests that write wait before they run. Nothing
+//! retries (`retry_on` is commented out in `reference/app/jobs/application_job.rb`); a failure or
+//! panic is logged. Queued work is lost if the process crashes, which the plan accepts. On
+//! shutdown the runner stops taking new work, performs what's queued and waits for it up to a
+//! deadline.
 //!
 //! Handlers are looked up in a [`Registry`]. Core registers `RemoveBannedContent` and
 //! `PurgeBlob`; integrations register `PushMessage` and `DeliverWebhook` through
@@ -21,15 +23,15 @@ use std::time::Duration;
 
 use anyhow::anyhow;
 use campfire_db::{Event, EventSink};
+use campfire_jobs::{Backlog, Lane};
 use futures_util::FutureExt as _;
 use futures_util::future::BoxFuture;
-use tokio::sync::{Mutex, mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::app::{App, Cable};
 
-/// How many jobs of each kind may wait before new ones of that kind are dropped (and logged).
-pub const QUEUE_CAPACITY: usize = 1024;
+/// How many jobs and Web Push deliveries may wait before requests that write wait for them.
+pub const QUEUE_CAPACITY: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum JobKind {
@@ -124,36 +126,40 @@ impl Work {
 /// Cheap to clone.
 #[derive(Clone)]
 pub struct Jobs {
-    queues: Arc<HashMap<JobKind, mpsc::Sender<Work>>>,
+    lanes: Arc<HashMap<JobKind, Arc<Lane<Work>>>>,
+    backlog: Arc<Backlog>,
     cable: Arc<OnceLock<Cable>>,
 }
 
 impl Jobs {
-    /// A queue of `capacity` for each kind, and their receiving ends, which [`start`] turns into
-    /// the runner.
+    /// A lane for each kind, sharing a backlog whose high-water mark is `capacity`, and the
+    /// lanes' receiving side, which [`start`] turns into the runner.
     pub fn new(capacity: usize) -> (Self, Queue) {
-        let (queues, receivers) = JobKind::ALL
-            .into_iter()
-            .map(|kind| {
-                let (sender, receiver) = mpsc::channel(capacity.max(1));
-                ((kind, sender), (kind, receiver))
-            })
-            .unzip();
-        (Self { queues: Arc::new(queues), cable: Arc::new(OnceLock::new()) }, Queue { receivers })
+        let lanes: HashMap<JobKind, Arc<Lane<Work>>> = JobKind::ALL.into_iter().map(|kind| (kind, Arc::default())).collect();
+        let lanes = Arc::new(lanes);
+        let backlog = Arc::new(Backlog::new(capacity));
+        (Self { lanes: lanes.clone(), backlog: backlog.clone(), cable: Arc::new(OnceLock::new()) }, Queue { lanes, backlog })
     }
 
-    /// Enqueues best-effort work (`SomeJob.perform_later`). Dropped with an error log when its
-    /// queue is full.
+    /// Enqueues work (`SomeJob.perform_later`).
     pub fn perform_later(&self, name: &'static str, work: impl Future<Output = anyhow::Result<()>> + Send + 'static) {
         self.enqueue(Work::AdHoc(name, Box::pin(work)));
     }
 
+    /// The jobs and deliveries waiting, which requests that write wait for.
+    pub fn backlog(&self) -> &Arc<Backlog> {
+        &self.backlog
+    }
+
     fn enqueue(&self, work: Work) {
         let name = work.name();
-        match self.queues[&work.kind()].try_send(work) {
+        self.backlog.added();
+        match self.lanes[&work.kind()].push(work) {
             Ok(()) => tracing::debug!(job = name, "enqueued"),
-            Err(mpsc::error::TrySendError::Full(_)) => tracing::error!(job = name, "job queue is full, dropping job"),
-            Err(mpsc::error::TrySendError::Closed(_)) => tracing::warn!(job = name, "job runner stopped, dropping job"),
+            Err(_) => {
+                self.backlog.finished();
+                tracing::warn!(job = name, "job runner stopped, dropping job");
+            }
         }
     }
 
@@ -179,14 +185,15 @@ impl EventSink for Jobs {
     }
 }
 
-/// The receiving ends of the queues, until the runner starts.
+/// The lanes' receiving side, until the runner starts.
 pub struct Queue {
-    receivers: Vec<(JobKind, mpsc::Receiver<Work>)>,
+    lanes: Arc<HashMap<JobKind, Arc<Lane<Work>>>>,
+    backlog: Arc<Backlog>,
 }
 
 /// The running job runner.
 pub struct Runner {
-    stopping: watch::Sender<bool>,
+    lanes: Arc<HashMap<JobKind, Arc<Lane<Work>>>>,
     workers: Vec<JoinHandle<()>>,
 }
 
@@ -194,7 +201,9 @@ impl Runner {
     /// Stops taking new work, performs what's already queued, and waits for running jobs until
     /// `deadline`, after which they're abandoned (logged).
     pub async fn shutdown(self, deadline: Duration) {
-        let _ = self.stopping.send(true);
+        for lane in self.lanes.values() {
+            lane.close();
+        }
         if tokio::time::timeout(deadline, futures_util::future::join_all(self.workers)).await.is_err() {
             tracing::warn!("jobs still running at shutdown were abandoned");
         }
@@ -204,43 +213,22 @@ impl Runner {
 /// Starts performing queued jobs: `concurrency` workers for each kind of job.
 pub fn start(queue: Queue, app: App, registry: Registry, concurrency: usize) -> Runner {
     app.jobs.set_cable(app.cable.clone());
-    let (stopping, _) = watch::channel(false);
     let registry = Arc::new(registry);
     let mut workers = Vec::new();
-    for (_, receiver) in queue.receivers {
-        let receiver = Arc::new(Mutex::new(receiver));
+    for lane in queue.lanes.values() {
         for _ in 0..concurrency.max(1) {
-            workers.push(tokio::spawn(work(receiver.clone(), app.clone(), registry.clone(), stopping.subscribe())));
+            workers.push(tokio::spawn(work(lane.clone(), queue.backlog.clone(), app.clone(), registry.clone())));
         }
     }
-    Runner { stopping, workers }
+    Runner { lanes: queue.lanes, workers }
 }
 
-/// One of a kind's workers: performs that kind's jobs, one at a time, until its queue has closed
+/// One of a kind's workers: performs that kind's jobs, one at a time, until its lane has closed
 /// and drained.
-async fn work(queue: Arc<Mutex<mpsc::Receiver<Work>>>, app: App, registry: Arc<Registry>, mut stopping: watch::Receiver<bool>) {
-    while let Some(work) = next(&queue, &mut stopping).await {
+async fn work(lane: Arc<Lane<Work>>, backlog: Arc<Backlog>, app: App, registry: Arc<Registry>) {
+    while let Some(work) = lane.next().await {
         perform(app.clone(), &registry, work).await;
-    }
-}
-
-/// The next job from the queue; once the runner is stopping, the queue closes and what's left in
-/// it drains.
-async fn next(queue: &Mutex<mpsc::Receiver<Work>>, stopping: &mut watch::Receiver<bool>) -> Option<Work> {
-    let mut queue = queue.lock().await;
-    tokio::select! {
-        work = queue.recv() => work,
-        () = stopped(stopping) => {
-            queue.close();
-            queue.recv().await
-        }
-    }
-}
-
-/// Resolves once shutdown starts. A runner dropped without a shutdown leaves its workers running.
-async fn stopped(stopping: &mut watch::Receiver<bool>) {
-    if stopping.wait_for(|stopping| *stopping).await.is_err() {
-        std::future::pending::<()>().await;
+        backlog.finished();
     }
 }
 

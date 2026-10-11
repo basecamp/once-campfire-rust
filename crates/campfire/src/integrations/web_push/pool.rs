@@ -1,24 +1,27 @@
 //! `WebPush::Pool` (reference/lib/web_push/pool.rb) with the invalid-subscription handler from
-//! reference/config/initializers/web_push.rb: up to 50 deliveries at once and 10,000 waiting
-//! (more are dropped, like `Concurrent::RejectedExecutionError`, and logged), and one worker that
+//! reference/config/initializers/web_push.rb: up to 50 deliveries at once, and one worker that
 //! destroys expired or unusable subscriptions in order.
+//!
+//! Rails drops deliveries beyond 10,000 waiting (`Concurrent::RejectedExecutionError`). Here they
+//! wait in a lane and are never dropped. Each one waiting counts in the app's job backlog, so a
+//! flood of deliveries holds back the requests that write, not the deliveries.
 
 use std::fmt::Display;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 use campfire_db::{Connection, PushPayload, PushSubscription};
-use tokio::sync::Semaphore;
+use campfire_jobs::{Backlog, Lane};
+use tokio::task::JoinHandle;
 
 use super::{Notification, VapidConfig};
 use crate::integrations::net::Network;
 
 /// `Concurrent::ThreadPoolExecutor.new(max_threads: 50, max_queue: 10000)`
 const MAX_THREADS: usize = 50;
+#[cfg(test)]
 const MAX_QUEUE: usize = 10_000;
-/// Deliveries running or waiting.
-const QUEUE_SLOTS: usize = MAX_THREADS + MAX_QUEUE;
 
 type Handler = Box<dyn Fn(i64) -> Result<(), String> + Send>;
 
@@ -30,13 +33,11 @@ pub struct Pool {
 struct Inner {
     net: Network,
     vapid: VapidConfig,
-    runtime: tokio::runtime::Handle,
-    running: Semaphore,
-    /// A delivery holds one of these until it finishes, or unwinds.
-    slots: Arc<Semaphore>,
-    /// Deliveries dropped since the queue was last accepting them.
-    dropped: AtomicUsize,
-    shut_down: AtomicBool,
+    deliveries: Lane<Notification>,
+    /// Deliveries waiting or running.
+    pending: AtomicUsize,
+    backlog: Arc<Backlog>,
+    workers: Mutex<Vec<JoinHandle<()>>>,
     invalidations: Mutex<Option<mpsc::Sender<i64>>>,
     invalidator: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
@@ -45,7 +46,17 @@ impl Pool {
     /// Call from inside the Tokio runtime deliveries should run on. `invalid_subscription_handler`
     /// is `Push::Subscription.find_by(id:)&.destroy`; it runs on the pool's own thread, so it may
     /// block (e.g. `Database::write_blocking`).
+    #[cfg(test)]
     pub fn new<F, E>(net: Network, vapid: VapidConfig, invalid_subscription_handler: F) -> Self
+    where
+        F: Fn(i64) -> Result<(), E> + Send + 'static,
+        E: Display,
+    {
+        Self::counting(net, vapid, invalid_subscription_handler, Arc::new(Backlog::new(MAX_QUEUE)))
+    }
+
+    /// [`Pool::new`], with each waiting delivery counted in `backlog`.
+    pub fn counting<F, E>(net: Network, vapid: VapidConfig, invalid_subscription_handler: F, backlog: Arc<Backlog>) -> Self
     where
         F: Fn(i64) -> Result<(), E> + Send + 'static,
         E: Display,
@@ -68,19 +79,19 @@ impl Pool {
             })
             .expect("spawn the web push invalidation thread");
 
-        Self {
-            inner: Arc::new(Inner {
-                net,
-                vapid,
-                runtime: tokio::runtime::Handle::current(),
-                running: Semaphore::new(MAX_THREADS),
-                slots: Arc::new(Semaphore::new(QUEUE_SLOTS)),
-                dropped: AtomicUsize::new(0),
-                shut_down: AtomicBool::new(false),
-                invalidations: Mutex::new(Some(sender)),
-                invalidator: Mutex::new(Some(invalidator)),
-            }),
-        }
+        let inner = Arc::new(Inner {
+            net,
+            vapid,
+            deliveries: Lane::default(),
+            pending: AtomicUsize::new(0),
+            backlog,
+            workers: Mutex::new(Vec::new()),
+            invalidations: Mutex::new(Some(sender)),
+            invalidator: Mutex::new(Some(invalidator)),
+        });
+        let workers = (0..MAX_THREADS).map(|_| tokio::spawn(deliver_queued(inner.clone()))).collect();
+        *inner.workers.lock().unwrap() = workers;
+        Self { inner }
     }
 
     /// `queue(payload, subscriptions)`: in id order (`find_each`), each subscription's
@@ -95,37 +106,21 @@ impl Pool {
 
     pub fn deliver_later(&self, notification: Notification) {
         let inner = &self.inner;
-        if inner.shut_down.load(Ordering::SeqCst) {
+        inner.pending.fetch_add(1, Ordering::AcqRel);
+        inner.backlog.added();
+        if inner.deliveries.push(notification).is_err() {
+            inner.delivered();
             tracing::warn!("WebPush::Pool is shut down, dropping a notification");
-            return;
         }
-        let Ok(slot) = inner.slots.clone().try_acquire_owned() else {
-            if inner.dropped.fetch_add(1, Ordering::SeqCst) == 0 {
-                tracing::error!("WebPush::Pool is full, dropping notifications");
-            }
-            return;
-        };
-        let dropped = inner.dropped.swap(0, Ordering::SeqCst);
-        if dropped > 0 {
-            tracing::error!("WebPush::Pool dropped {dropped} notifications while it was full");
-        }
-        let pool = self.inner.clone();
-        inner.runtime.spawn(async move {
-            // Released when the delivery finishes, or when Tokio drops the task after a panic.
-            let _slot = slot;
-            if let Ok(_running) = pool.running.acquire().await {
-                pool.deliver(&notification).await;
-            }
-        });
     }
 
     /// Waits (up to a second, like `wait_for_termination(1)`) for queued deliveries, then stops
     /// the invalidation worker once it has drained.
     pub async fn shutdown(&self) {
         let inner = &self.inner;
-        inner.shut_down.store(true, Ordering::SeqCst);
-        // Every slot free means nothing is queued or running.
-        let _ = tokio::time::timeout(Duration::from_secs(1), inner.slots.acquire_many(QUEUE_SLOTS as u32)).await;
+        inner.deliveries.close();
+        let workers = std::mem::take(&mut *inner.workers.lock().unwrap());
+        let _ = tokio::time::timeout(Duration::from_secs(1), futures_util::future::join_all(workers)).await;
         inner.invalidations.lock().unwrap().take();
         let worker = inner.invalidator.lock().unwrap().take();
         if let Some(worker) = worker {
@@ -140,11 +135,28 @@ impl Pool {
     /// Queued or running deliveries.
     #[cfg(test)]
     pub fn pending(&self) -> usize {
-        QUEUE_SLOTS - self.inner.slots.available_permits()
+        self.inner.pending.load(Ordering::Acquire)
+    }
+}
+
+/// One of the pool's 50 workers. A delivery that panics is counted as done, and the worker
+/// carries on.
+async fn deliver_queued(inner: Arc<Inner>) {
+    while let Some(notification) = inner.deliveries.next().await {
+        let delivery = std::panic::AssertUnwindSafe(inner.deliver(&notification));
+        if futures_util::FutureExt::catch_unwind(delivery).await.is_err() {
+            tracing::error!("Error in WebPush::Pool.deliver: panic");
+        }
+        inner.delivered();
     }
 }
 
 impl Inner {
+    fn delivered(&self) {
+        self.pending.fetch_sub(1, Ordering::AcqRel);
+        self.backlog.finished();
+    }
+
     async fn deliver(&self, notification: &Notification) {
         match notification.deliver(&self.net, &self.vapid).await {
             Ok(_) => {}

@@ -1,8 +1,14 @@
 //! One writer thread that owns the write connection and takes a bounded queue of work, plus
-//! reader threads that take reads from one queue, each with a free reader connection. Each write
-//! runs in `BEGIN IMMEDIATE` (`default_transaction_mode: immediate` in
-//! `reference/config/database.yml`), then its after-commit work runs in order, outside the
-//! transaction, the way Active Record runs `after_commit` callbacks.
+//! reader threads that take reads from one queue, each with a free reader connection.
+//!
+//! The writer commits in groups. It takes every write that is queued, up to [`MAX_GROUP`], runs
+//! them in order in one `BEGIN IMMEDIATE` transaction (`default_transaction_mode: immediate` in
+//! `reference/config/database.yml`), each in a savepoint of its own, and commits once. A write
+//! that fails or panics rolls back to its savepoint, so the others in the group are unaffected.
+//! After the commit, each write's after-commit work runs in order, outside the transaction, the
+//! way Active Record runs `after_commit` callbacks, and then its caller gets its result. So every
+//! write is committed before its caller hears of it, as before; a group writes the pages that its
+//! writes share (a room's row, the search index) to the WAL once.
 //!
 //! Reads run on their own threads rather than tokio's blocking pool, where a read that found
 //! every connection busy parked a blocking thread until one came free (99–136 threads for 5
@@ -135,18 +141,133 @@ impl<'c> Tx<'c> {
     }
 }
 
-/// Runs `f` in `BEGIN IMMEDIATE`, commits, then runs the after-commit queue. An error from
-/// `f`, a panic in it, or a failed commit rolls back and discards the queue. An error from an
-/// after-commit hook is returned after the rest of the queue has run (Rails raises it from the
-/// save that committed).
-pub fn run_write<T>(conn: &Connection, env: &Env, f: impl FnOnce(&mut Tx<'_>) -> Result<T>) -> Result<T> {
-    // Rolls back when dropped without committing.
-    let transaction = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-    let mut tx = Tx { conn, env, in_transaction: true, after_commit: Vec::new() };
-    let value = f(&mut tx)?;
-    transaction.commit()?;
+/// Runs a read in one read transaction. SQLite then takes its WAL read lock (a process-wide
+/// mutex and `fcntl` locks) once for the read, not once for each statement, and every statement
+/// of the read sees the same snapshot. A read already inside a transaction runs in it.
+fn snapshot<T>(conn: &Connection, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+    if !conn.is_autocommit() {
+        return f(conn);
+    }
+    conn.execute_batch("BEGIN")?;
+    /// Ends the transaction however the read ends, a panic included.
+    struct End<'c>(&'c Connection);
+    impl Drop for End<'_> {
+        fn drop(&mut self) {
+            if !self.0.is_autocommit() && self.0.execute_batch("COMMIT").is_err() {
+                let _ = self.0.execute_batch("ROLLBACK");
+            }
+        }
+    }
+    let _end = End(conn);
+    f(conn)
+}
 
-    let mut queue = std::mem::take(&mut tx.after_commit);
+/// The most writes the writer commits together.
+pub const MAX_GROUP: usize = 64;
+
+/// What a write left for after its group commits: its after-commit work and its reply.
+type Finish = Box<dyn FnOnce(&Connection, &Env, Result<()>) + Send>;
+
+/// A queued write. It runs inside the group's transaction, in a savepoint of its own, and returns
+/// what is left for after the commit; a write that failed has replied already and returns `None`.
+type Job = Box<dyn FnOnce(&Connection, &Env) -> Option<Finish> + Send>;
+
+/// The savepoint every write runs in.
+const SAVEPOINT: &str = "campfire_write";
+
+/// `f` as a write of a group, replying through `reply`.
+fn group_write<T, F>(f: F, reply: impl FnOnce(Result<T>) + Send + 'static) -> Job
+where
+    T: Send + 'static,
+    F: FnOnce(&mut Tx<'_>) -> Result<T> + Send + 'static,
+{
+    Box::new(move |conn, env| {
+        if let Err(error) = conn.execute_batch(&format!("SAVEPOINT {SAVEPOINT}")) {
+            reply(Err(error.into()));
+            return None;
+        }
+        let mut tx = Tx { conn, env, in_transaction: true, after_commit: Vec::new() };
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut tx)));
+        let undo = || {
+            let _ = conn.execute_batch(&format!("ROLLBACK TO {SAVEPOINT}; RELEASE {SAVEPOINT}"));
+        };
+        match outcome {
+            Ok(Ok(value)) => {
+                if let Err(error) = conn.execute_batch(&format!("RELEASE {SAVEPOINT}")) {
+                    undo();
+                    reply(Err(error.into()));
+                    return None;
+                }
+                let queue = std::mem::take(&mut tx.after_commit);
+                Some(Box::new(move |conn, env, committed| match committed {
+                    Ok(()) => reply(run_after_commit(conn, env, queue).map(|()| value)),
+                    Err(error) => reply(Err(error)),
+                }))
+            }
+            Ok(Err(error)) => {
+                undo();
+                reply(Err(error));
+                None
+            }
+            // The reply drops with the closure: the caller sees the write fail, as when a
+            // transaction panicked on its own.
+            Err(_) => {
+                undo();
+                None
+            }
+        }
+    })
+}
+
+/// Runs a group of writes in one transaction and commits it, then finishes each write in order.
+fn commit_group(conn: &Connection, env: &Env, jobs: Vec<Job>) {
+    let mut finishes: Vec<Finish> = Vec::with_capacity(jobs.len());
+    let begin = || conn.execute_batch("BEGIN IMMEDIATE TRANSACTION");
+    if let Err(error) = begin() {
+        // No transaction: each write still gets an answer.
+        let error: Error = error.into();
+        for job in jobs {
+            fail_job(conn, env, job, &error);
+        }
+        return;
+    }
+    for job in jobs {
+        if let Some(finish) = job(conn, env) {
+            finishes.push(finish);
+        }
+        // SQLite rolls a transaction back by itself on some errors (a full disk, I/O, out of
+        // memory). The writes before have gone with it; the rest get a transaction of their own.
+        if conn.is_autocommit() {
+            for finish in finishes.drain(..) {
+                finish(conn, env, Err(Error::other("the write's transaction rolled back")));
+            }
+            if begin().is_err() {
+                return;
+            }
+        }
+    }
+    let committed = conn.execute_batch("COMMIT TRANSACTION").map_err(Error::from);
+    if committed.is_err() && !conn.is_autocommit() {
+        let _ = conn.execute_batch("ROLLBACK TRANSACTION");
+    }
+    for finish in finishes {
+        let committed = committed.as_ref().map(|_| ()).map_err(|error| Error::other(error.to_string()));
+        finish(conn, env, committed);
+    }
+}
+
+/// A job that can't run because its group has no transaction: it runs alone, so its caller still
+/// gets an answer, and the failure is logged.
+fn fail_job(conn: &Connection, env: &Env, job: Job, error: &Error) {
+    tracing::error!(%error, "write group could not begin; running the write alone");
+    if let Some(finish) = job(conn, env) {
+        finish(conn, env, Ok(()));
+    }
+}
+
+/// Runs a committed write's after-commit queue. An error from a hook is returned after the rest
+/// of the queue has run (Rails raises it from the save that committed).
+fn run_after_commit(conn: &Connection, env: &Env, mut queue: Vec<AfterCommit>) -> Result<()> {
     let mut first_error = None;
     let mut after = Tx { conn, env, in_transaction: false, after_commit: Vec::new() };
     for item in queue.drain(..) {
@@ -162,8 +283,20 @@ pub fn run_write<T>(conn: &Connection, env: &Env, f: impl FnOnce(&mut Tx<'_>) ->
     }
     match first_error {
         Some(error) => Err(error),
-        None => Ok(value),
+        None => Ok(()),
     }
+}
+
+/// Runs `f` in `BEGIN IMMEDIATE`, commits, then runs the after-commit queue: one write on its
+/// own, outside the writer's groups. An error from `f`, a panic in it, or a failed commit rolls
+/// back and discards the queue.
+pub fn run_write<T>(conn: &Connection, env: &Env, f: impl FnOnce(&mut Tx<'_>) -> Result<T>) -> Result<T> {
+    // Rolls back when dropped without committing.
+    let transaction = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let mut tx = Tx { conn, env, in_transaction: true, after_commit: Vec::new() };
+    let value = f(&mut tx)?;
+    transaction.commit()?;
+    run_after_commit(conn, env, std::mem::take(&mut tx.after_commit)).map(|()| value)
 }
 
 #[derive(Debug, Clone)]
@@ -184,7 +317,6 @@ impl Config {
     }
 }
 
-type Job = Box<dyn FnOnce(&Connection, &Env) + Send>;
 type Read = Box<dyn FnOnce(&Connection) + Send>;
 
 /// The database handle. Cheap to clone.
@@ -213,11 +345,17 @@ impl Database {
         std::thread::Builder::new()
             .name("campfire-db-writer".into())
             .spawn(move || {
-                while let Some(job) = receiver.blocking_recv() {
-                    // A panicking write must not take the writer down with it. `run_write`'s
-                    // transaction rolls back as the panic unwinds; the rollback here is a
-                    // backstop for a job that panics some other way.
-                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(&conn, &writer_env)));
+                while let Some(first) = receiver.blocking_recv() {
+                    let mut jobs = vec![first];
+                    while jobs.len() < MAX_GROUP {
+                        match receiver.try_recv() {
+                            Ok(job) => jobs.push(job),
+                            Err(_) => break,
+                        }
+                    }
+                    // A panicking write must not take the writer down with it. Each write catches
+                    // its own panic; the rollback here is a backstop for a panic elsewhere.
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| commit_group(&conn, &writer_env, jobs)));
                     if outcome.is_err() && !conn.is_autocommit() {
                         let _ = conn.execute_batch("ROLLBACK TRANSACTION");
                     }
@@ -251,8 +389,8 @@ impl Database {
     {
         let (reply, response) = oneshot::channel();
         self.writer
-            .send(Box::new(move |conn, env| {
-                let _ = reply.send(run_write(conn, env, f));
+            .send(group_write(f, move |result| {
+                let _ = reply.send(result);
             }))
             .await
             .map_err(|_| Error::WriterGone)?;
@@ -267,8 +405,8 @@ impl Database {
     {
         let (reply, response) = oneshot::channel();
         self.writer
-            .blocking_send(Box::new(move |conn, env| {
-                let _ = reply.send(run_write(conn, env, f));
+            .blocking_send(group_write(f, move |result| {
+                let _ = reply.send(result);
             }))
             .map_err(|_| Error::WriterGone)?;
         response.blocking_recv().map_err(|_| Error::WriterGone)?
@@ -291,8 +429,8 @@ impl Database {
             return self.read_offloaded(f).await;
         };
         // A panicking read fails its caller's read, as on a reader thread, and gives its connection back.
-        let result =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&conn))).unwrap_or_else(|_| Err(Error::other("the read panicked")));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| snapshot(&conn, f)))
+            .unwrap_or_else(|_| Err(Error::other("the read panicked")));
         self.readers.queue.give_back(conn);
         // Give the worker's other tasks their turn, as the hop to another thread did.
         tokio::task::yield_now().await;
@@ -309,7 +447,7 @@ impl Database {
     {
         let (reply, response) = oneshot::channel();
         self.readers.queue.push(Box::new(move |conn| {
-            let _ = reply.send(f(conn));
+            let _ = reply.send(snapshot(conn, f));
         }));
         // A read that panics drops its reply as it unwinds.
         response.await.map_err(|_| Error::other("the read panicked"))?
@@ -322,12 +460,12 @@ impl Database {
         let mut kept = match self.blocking_reader.try_lock() {
             Ok(kept) => kept,
             Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-            Err(TryLockError::WouldBlock) => return f(&open_connection(&self.path, true)?),
+            Err(TryLockError::WouldBlock) => return snapshot(&open_connection(&self.path, true)?, f),
         };
         if kept.is_none() {
             *kept = Some(open_connection(&self.path, true)?);
         }
-        f(kept.as_ref().expect("opened"))
+        snapshot(kept.as_ref().expect("opened"), f)
     }
 }
 
@@ -908,5 +1046,109 @@ mod tests {
         }
         let wal = std::fs::metadata(path.with_extension("sqlite3-wal")).unwrap().len();
         assert!(wal < (WAL_LIMIT_PAGES as u64 + 1000) * 4200, "WAL of {wal} bytes");
+    }
+
+    /// Writes queued together commit together, and one that fails rolls back alone: its group's
+    /// other writes keep their rows, and each caller gets its own result.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failing_write_rolls_back_alone_in_its_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_with_readers(&dir, 1);
+        db.write(|tx| Ok(tx.conn().execute_batch("CREATE TABLE grouped (v INTEGER UNIQUE)")?)).await.unwrap();
+        let writes: Vec<_> = (0..200i64)
+            .map(|i| {
+                let db = db.clone();
+                tokio::spawn(async move {
+                    db.write(move |tx| {
+                        tx.conn().execute("INSERT INTO grouped (v) VALUES (?1)", [i % 150])?;
+                        Ok(i)
+                    })
+                    .await
+                })
+            })
+            .collect();
+        let mut written = 0;
+        for write in writes {
+            if write.await.unwrap().is_ok() {
+                written += 1;
+            }
+        }
+        assert_eq!(written, 150, "the 50 repeated values fail on the unique index");
+        let rows = db.read(|conn| Ok(conn.query_row("SELECT count(*) FROM grouped", [], |row| row.get::<_, i64>(0))?)).await.unwrap();
+        assert_eq!(rows, 150);
+    }
+
+    /// A write's after-commit work runs once its group has committed, in the order of the writes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn after_commit_work_runs_in_write_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_with_readers(&dir, 1);
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let writes: Vec<_> = (0..50)
+            .map(|i| {
+                let (db, order) = (db.clone(), order.clone());
+                async move {
+                    db.write(move |tx| {
+                        tx.after_commit(move |tx| {
+                            assert!(!tx.in_transaction());
+                            order.lock().unwrap().push(i);
+                            Ok(())
+                        });
+                        Ok(())
+                    })
+                    .await
+                }
+            })
+            .collect();
+        for result in futures_join(writes).await {
+            result.unwrap();
+        }
+        assert_eq!(*order.lock().unwrap(), (0..50).collect::<Vec<_>>());
+    }
+
+    /// Polls the futures in order, so their writes queue in order.
+    async fn futures_join<F: Future>(futures: Vec<F>) -> Vec<F::Output> {
+        let mut pinned: Vec<_> = futures.into_iter().map(Box::pin).collect();
+        let mut outputs: Vec<Option<F::Output>> = pinned.iter().map(|_| None).collect();
+        std::future::poll_fn(|cx| {
+            let mut pending = false;
+            for (future, output) in pinned.iter_mut().zip(outputs.iter_mut()) {
+                if output.is_none() {
+                    match future.as_mut().poll(cx) {
+                        std::task::Poll::Ready(value) => *output = Some(value),
+                        std::task::Poll::Pending => pending = true,
+                    }
+                }
+            }
+            if pending { std::task::Poll::Pending } else { std::task::Poll::Ready(()) }
+        })
+        .await;
+        outputs.into_iter().map(|output| output.expect("ready")).collect()
+    }
+
+    /// A read sees one snapshot: a write that commits while the read runs is not visible to the
+    /// read's later statements.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_read_sees_one_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_with_readers(&dir, 1);
+        db.write(|tx| Ok(tx.conn().execute_batch("CREATE TABLE snap (v INTEGER); INSERT INTO snap VALUES (1)")?)).await.unwrap();
+        let writer = db.clone();
+        let (before, after) = db
+            .read_offloaded(move |conn| {
+                let count = |conn: &Connection| conn.query_row("SELECT count(*) FROM snap", [], |row| row.get::<_, i64>(0));
+                let before = count(conn)?;
+                std::thread::spawn(move || {
+                    writer.write_blocking(|tx| Ok(tx.conn().execute("INSERT INTO snap VALUES (2)", []).map(|_| ())?))
+                })
+                .join()
+                .unwrap()?;
+                Ok((before, count(conn)?))
+            })
+            .await
+            .unwrap();
+        assert_eq!((before, after), (1, 1));
+        let now = db.read(|conn| Ok(conn.query_row("SELECT count(*) FROM snap", [], |row| row.get::<_, i64>(0))?)).await.unwrap();
+        assert_eq!(now, 2);
     }
 }

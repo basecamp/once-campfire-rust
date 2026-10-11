@@ -17,6 +17,7 @@ campfire_db.workspace = true
 campfire_richtext.workspace = true
 campfire_storage.workspace = true
 campfire_cable.workspace = true
+campfire_jobs.workspace = true
 campfire_assets.workspace = true
 campfire_views.workspace = true
 anyhow.workspace = true

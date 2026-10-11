@@ -24,7 +24,9 @@ campfire_routes   = { path = "crates/routes" }
 campfire_db       = { path = "crates/db" }
 campfire_richtext = { path = "crates/richtext" }
 campfire_storage  = { path = "crates/storage" }
+campfire_bus      = { path = "crates/bus" }
 campfire_cable    = { path = "crates/cable" }
+campfire_jobs     = { path = "crates/jobs" }
 campfire_assets   = { path = "crates/assets" }
 campfire_views    = { path = "crates/views" }
 

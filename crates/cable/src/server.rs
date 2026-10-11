@@ -1,20 +1,19 @@
 //! `ActionCable::Server::Base`: configuration, the channel registry, broadcasting, the heartbeat,
 //! remote disconnects and the `/cable` endpoint.
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Once, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::extract::Request;
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
-use rails_compat::json;
 use serde::Serialize;
-use tokio::sync::{broadcast, watch};
 
 use crate::channel::Channel;
-use crate::pubsub::{Frame, Hub};
 use crate::socket::Handshake;
 use crate::{connection, naming, protocol};
+use campfire_bus::{Frame, Hub, Limits, wake};
 
 /// `config.action_cable.*` as the production reference runs it.
 #[derive(Debug, Clone)]
@@ -26,9 +25,12 @@ pub struct Config {
     /// `config.assume_ssl` (on unless `DISABLE_SSL`): `ActionDispatch::AssumeSSL` makes every
     /// request look like HTTPS, so the same-origin check compares against `https://<host>`.
     pub assume_ssl: bool,
-    /// Messages buffered per broadcasting (shared by its subscribers) before a slow subscriber
-    /// counts as lagging and is disconnected with `reconnect: true`.
+    /// Messages a subscriber may fall behind its broadcasting before it counts as lagging and is
+    /// disconnected with `reconnect: true`. Frames are shared by every subscriber, so a lane holds
+    /// at most this many frames for its live subscribers.
     pub stream_capacity: usize,
+    /// Payload bytes a subscriber may fall behind, with the same effect.
+    pub stream_capacity_bytes: usize,
     /// Frames coalesced into one socket write at most, which also bounds what a connection
     /// buffers beyond the socket.
     pub max_write_batch: usize,
@@ -43,7 +45,8 @@ impl Default for Config {
             allowed_request_origins: Vec::new(),
             allow_same_origin_as_host: true,
             assume_ssl: true,
-            stream_capacity: 256,
+            stream_capacity: 4096,
+            stream_capacity_bytes: 64 << 20,
             max_write_batch: 64,
             close_timeout: Duration::from_secs(5),
         }
@@ -91,15 +94,17 @@ impl<U: Identified + Send + Sync + 'static> ServerBuilder<U> {
     }
 
     pub fn build(self) -> Server<U> {
-        let (restart, _) = broadcast::channel(1);
+        let limits = Limits { frames: self.config.stream_capacity as u64, bytes: self.config.stream_capacity_bytes as u64 };
         Server {
             inner: Arc::new(Inner {
-                hub: Hub::new(self.config.stream_capacity),
+                hub: Hub::new(limits, protocol::message),
                 config: self.config,
                 authenticator: self.authenticator,
                 channels: self.channels,
-                heartbeat: OnceLock::new(),
-                restart,
+                heartbeat: Once::new(),
+                beats: AtomicU64::new(0),
+                ping: Mutex::new(protocol::ping(unix_now()).into()),
+                restarts: AtomicU64::new(0),
             }),
         }
     }
@@ -120,8 +125,11 @@ struct Inner<U: Send + Sync + 'static> {
     hub: Arc<Hub>,
     authenticator: Arc<dyn Authenticate<U>>,
     channels: HashMap<Arc<str>, ChannelFactory<U>>,
-    heartbeat: OnceLock<watch::Receiver<Frame>>,
-    restart: broadcast::Sender<()>,
+    heartbeat: Once,
+    /// Heartbeats so far, and the latest one's ping frame, shared by every connection.
+    beats: AtomicU64,
+    ping: Mutex<Frame>,
+    restarts: AtomicU64,
 }
 
 impl<U: Identified + Send + Sync + 'static> Server<U> {
@@ -151,9 +159,10 @@ impl<U: Identified + Send + Sync + 'static> Server<U> {
         }
         let request = ConnectRequest { uri: parts.uri, headers: parts.headers };
         let server = self.clone();
-        connections_runtime().spawn(async move {
+        let shard = wake::next();
+        wake::handle(shard).spawn(async move {
             if let Ok(upgraded) = on_upgrade.await {
-                connection::run(server, hyper_util::rt::TokioIo::new(upgraded), handshake.deflate(), request).await;
+                connection::run(server, hyper_util::rt::TokioIo::new(upgraded), handshake.deflate(), request, shard).await;
             }
         });
         response
@@ -177,7 +186,8 @@ impl<U: Send + Sync + 'static> Server<U> {
         &self.inner.config
     }
 
-    pub(crate) fn hub(&self) -> &Arc<Hub> {
+    /// The bus hub that this server's subscriptions read.
+    pub fn hub(&self) -> &Arc<Hub> {
         &self.inner.hub
     }
 
@@ -191,18 +201,25 @@ impl<U: Send + Sync + 'static> Server<U> {
         self.inner.channels.get_key_value(requested.strip_prefix("::").unwrap_or(requested))
     }
 
-    pub(crate) fn heartbeat(&self) -> watch::Receiver<Frame> {
-        self.start_heartbeat().clone()
+    /// Heartbeats so far.
+    pub(crate) fn beats(&self) -> u64 {
+        self.inner.beats.load(Ordering::Acquire)
     }
 
-    pub(crate) fn restarts(&self) -> broadcast::Receiver<()> {
-        self.inner.restart.subscribe()
+    /// The latest heartbeat's ping frame.
+    pub(crate) fn ping(&self) -> Frame {
+        self.inner.ping.lock().unwrap().clone()
+    }
+
+    /// Restarts so far.
+    pub(crate) fn restarts(&self) -> u64 {
+        self.inner.restarts.load(Ordering::Acquire)
     }
 
     /// `ActionCable.server.broadcast(broadcasting, message)`.
     pub fn broadcast<T: Serialize + ?Sized>(&self, broadcasting: &str, message: &T) -> usize {
         tracing::debug!(broadcasting, "[ActionCable] Broadcasting");
-        self.inner.hub.broadcast(broadcasting, &json::encode(message))
+        self.inner.hub.broadcast(broadcasting, &rails_compat::json::encode(message))
     }
 
     /// `SomeChannel.broadcast_to(broadcastables, message)`.
@@ -229,7 +246,8 @@ impl<U: Send + Sync + 'static> Server<U> {
 
     /// `ActionCable.server.restart`: closes every connection with `server_restart`.
     pub fn restart(&self) {
-        let _ = self.inner.restart.send(());
+        self.inner.restarts.fetch_add(1, Ordering::AcqRel);
+        self.inner.hub.ring_all();
     }
 
     fn allow_request_origin(&self, headers: &HeaderMap) -> bool {
@@ -252,22 +270,22 @@ impl<U: Send + Sync + 'static> Server<U> {
     }
 
     /// The server-wide heartbeat timer, started on the first request like Rails'
-    /// `setup_heartbeat_timer`, so every connection pings in step.
-    fn start_heartbeat(&self) -> &watch::Receiver<Frame> {
-        self.inner.heartbeat.get_or_init(|| {
-            let (sender, receiver) = watch::channel(Frame::from(protocol::ping(unix_now())));
+    /// `setup_heartbeat_timer`, so every connection pings in step. It stops with the server.
+    fn start_heartbeat(&self) {
+        self.inner.heartbeat.call_once(|| {
+            let inner: Weak<Inner<U>> = Arc::downgrade(&self.inner);
             tokio::spawn(async move {
                 let period = Duration::from_secs(protocol::BEAT_INTERVAL);
                 let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
                 loop {
                     interval.tick().await;
-                    if sender.send(protocol::ping(unix_now()).into()).is_err() {
-                        break;
-                    }
+                    let Some(inner) = inner.upgrade() else { break };
+                    *inner.ping.lock().unwrap() = protocol::ping(unix_now()).into();
+                    inner.beats.fetch_add(1, Ordering::AcqRel);
+                    inner.hub.ring_all();
                 }
             });
-            receiver
-        })
+        });
     }
 }
 
@@ -313,19 +331,6 @@ fn negotiate_protocol(headers: &HeaderMap) -> Option<&'static str> {
 /// `Connection::Base#respond_to_invalid_request`.
 fn page_not_found() -> Response {
     (StatusCode::NOT_FOUND, [(header::CONTENT_TYPE, "text/plain; charset=utf-8")], "Page not found").into_response()
-}
-
-/// The runtime connections run on, apart from the app's. A broadcast to a big room wakes every
-/// subscriber's task at once; on a shared runtime the HTTP requests that arrive meanwhile (the
-/// POST that made the broadcast among them) queue behind that whole wave. On threads of their own,
-/// the OS shares the cores between requests and the wave.
-fn connections_runtime() -> &'static tokio::runtime::Handle {
-    static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-    RUNTIME
-        .get_or_init(|| {
-            tokio::runtime::Builder::new_multi_thread().thread_name("cable").enable_all().build().expect("the cable runtime starts")
-        })
-        .handle()
 }
 
 #[cfg(test)]

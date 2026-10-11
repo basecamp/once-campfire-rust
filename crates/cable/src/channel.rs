@@ -1,13 +1,14 @@
 //! `ActionCable::Channel::Base`: one instance per subscription, driven by the connection.
 use std::sync::Arc;
 
-use futures_util::stream::{AbortHandle, AbortRegistration};
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use rails_compat::json;
 use serde::Serialize;
 use serde_json::{Map, Value};
 
-use crate::pubsub::Subscriber;
 use crate::{Server, naming, protocol};
+use campfire_bus::{Bell, Cursor};
 
 pub type Params = Map<String, Value>;
 
@@ -71,10 +72,13 @@ pub struct Subscription<U: Send + Sync + 'static> {
     pub(crate) identifier: Arc<str>,
     pub(crate) encoded_identifier: Arc<str>,
     pub(crate) current_user: Arc<U>,
-    pub(crate) streams: Vec<(String, AbortHandle)>,
+    pub(crate) streams: Vec<(String, Stopped)>,
     /// Streams started by the last callback, for the connection to start reading once that
     /// callback's own frames (transmissions, the confirmation) are queued ahead of them.
-    pub(crate) started: Vec<(Subscriber, AbortRegistration)>,
+    pub(crate) started: Vec<(Cursor, Stopped)>,
+    /// The connection's bell and shard, which the subscription's streams ring and live on.
+    pub(crate) bell: Arc<Bell>,
+    pub(crate) shard: usize,
     pub(crate) rejected: bool,
     pub(crate) unsubscribed: bool,
     pub(crate) transmissions: Vec<String>,
@@ -127,10 +131,10 @@ impl<U: Send + Sync + 'static> Subscription<U> {
         }
         let broadcasting = broadcasting.into();
         // The hub wraps each broadcast for this identifier once, for every subscriber sharing it.
-        let subscriber = self.server.hub().subscribe(&broadcasting, Some(self.encoded_identifier.clone()));
-        let (handle, registration) = AbortHandle::new_pair();
-        self.started.push((subscriber, registration));
-        self.streams.push((broadcasting, handle));
+        let cursor = self.server.hub().subscribe(&broadcasting, Some(self.encoded_identifier.clone()), &self.bell, self.shard);
+        let stopped = Stopped::default();
+        self.started.push((cursor, stopped.clone()));
+        self.streams.push((broadcasting, stopped));
     }
 
     pub fn stream_for(&mut self, broadcastables: &[&str]) {
@@ -139,18 +143,19 @@ impl<U: Send + Sync + 'static> Subscription<U> {
     }
 
     pub fn stop_stream_from(&mut self, broadcasting: &str) {
-        self.streams.retain(|(name, handle)| {
+        self.streams.retain(|(name, stopped)| {
             let keep = name != broadcasting;
             if !keep {
-                handle.abort();
+                stopped.stop();
             }
             keep
         });
+        self.started.retain(|(_, stopped)| !stopped.is_stopped());
     }
 
     pub fn stop_all_streams(&mut self) {
-        for (_, handle) in self.streams.drain(..) {
-            handle.abort();
+        for (_, stopped) in self.streams.drain(..) {
+            stopped.stop();
         }
         self.started.clear();
     }
@@ -185,5 +190,20 @@ impl<U: Send + Sync + 'static> Subscription<U> {
 impl<U: Send + Sync + 'static> Drop for Subscription<U> {
     fn drop(&mut self) {
         self.stop_all_streams();
+    }
+}
+
+/// A stream's stop flag, shared by the subscription that started it and the connection that
+/// reads it. The connection drops a stopped stream's cursor after the command that stopped it.
+#[derive(Clone, Default)]
+pub(crate) struct Stopped(Arc<AtomicBool>);
+
+impl Stopped {
+    pub(crate) fn stop(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn is_stopped(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
     }
 }

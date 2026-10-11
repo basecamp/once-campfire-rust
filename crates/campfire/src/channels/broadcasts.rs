@@ -45,6 +45,8 @@ pub fn message_dom_id(message: &Message, prefix: Option<&str>) -> String {
 }
 
 pub const ROOMS: &str = "rooms";
+/// How far a room's slowest reader may fall behind before a post waits for it.
+pub const SETTLE_LAG: u64 = 256;
 pub const MESSAGES: &str = "messages";
 const MAINTAIN_SCROLL: &[(&str, Option<&str>)] = &[("maintain_scroll", Some("true"))];
 
@@ -90,6 +92,16 @@ impl Broadcasts {
         let html = partials.message(message);
         self.to(&Self::room_messages(room), Action::Append, &room_dom_id(room, MESSAGES), Some(&html), &[]);
         self.unread_room(conn, room)
+    }
+
+    /// Waits while a subscriber of the room's messages stream is more than [`SETTLE_LAG`]
+    /// messages behind, for at most ten seconds: the poster waits for the room's readers rather
+    /// than outrunning them, so they are not disconnected for lagging, and their queues stay short.
+    pub async fn settle_messages(&self, room: &Room) {
+        let [gid, messages] = Self::room_messages(room);
+        let name = campfire_cable::naming::stream_name_from(&[&gid, &messages]);
+        let hub = self.server.hub();
+        hub.settle(&name, SETTLE_LAG.min(hub.limits().frames / 2), std::time::Duration::from_secs(10)).await;
     }
 
     /// `broadcast_unread_room`: `{ roomId: }` to each member's `user_<id>_unreads`.

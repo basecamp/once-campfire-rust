@@ -1,6 +1,6 @@
 use std::sync::Mutex as StdMutex;
 
-use tokio::sync::{Notify, mpsc::UnboundedSender};
+use tokio::sync::{Notify, mpsc, mpsc::UnboundedSender};
 
 use super::*;
 use crate::app::{Booted, boot};
@@ -74,9 +74,8 @@ impl std::io::Write for LogWriter {
 }
 
 #[tokio::test]
-async fn a_busy_or_full_kind_doesnt_hold_up_the_others() {
+async fn a_busy_kind_doesnt_hold_up_the_others_and_drops_nothing() {
     let (booted, _dir) = app().await;
-    let (logs, _guard) = Logs::capture();
     let (performed, mut performed_rx) = mpsc::unbounded_channel();
     let slow_bot = Arc::new(Notify::new());
     let mut registry = Registry::default();
@@ -85,22 +84,24 @@ async fn a_busy_or_full_kind_doesnt_hold_up_the_others() {
     let (jobs, queue) = Jobs::new(2);
     let runner = start(queue, booted.app.clone(), registry, 1);
 
-    // One webhook runs (stuck on the slow bot), two wait, and the rest are dropped.
-    jobs.emit(webhook(1));
-    while jobs.queues[&JobKind::DeliverWebhook].capacity() < 2 {
-        tokio::task::yield_now().await;
-    }
-    for message_id in 2..=10 {
+    // One webhook runs (stuck on the slow bot) and nine wait; the purge runs meanwhile.
+    for message_id in 1..=10 {
         jobs.emit(webhook(message_id));
     }
     jobs.emit(Event::PurgeBlob { blob_id: 7 });
     assert_eq!(next_performed(&mut performed_rx).await, Event::PurgeBlob { blob_id: 7 });
-    assert!(logs.text().contains("job queue is full, dropping job job=\"Bot::WebhookJob\""), "{}", logs.text());
+    assert_eq!(jobs.backlog().depth(), 10, "every webhook waits; none is dropped");
 
-    for _ in 0..3 {
+    // Over the mark, a write waits until half of the backlog has drained.
+    let admitted = tokio::spawn({
+        let backlog = jobs.backlog().clone();
+        async move { backlog.admit().await }
+    });
+    for _ in 0..10 {
         slow_bot.notify_one();
         assert!(matches!(next_performed(&mut performed_rx).await, Event::DeliverWebhook { .. }));
     }
+    tokio::time::timeout(Duration::from_secs(5), admitted).await.unwrap().unwrap();
     runner.shutdown(Duration::from_secs(5)).await;
     assert!(performed_rx.try_recv().is_err());
 }
