@@ -280,6 +280,23 @@ fn form_post(uri: &str, body: &str) -> HttpRequest<AxumBody> {
 }
 
 #[tokio::test]
+async fn an_action_panic_after_suspension_still_renders_the_error_page() {
+    async fn panicking(_c: &mut Ctx) -> Result {
+        tokio::task::yield_now().await;
+        panic!("action failed after yielding");
+    }
+    let config = KitConfig { error_pages: ErrorPages::new([(500, "<h1>Internal error</h1>".into())]), ..KitConfig::default() };
+    let router = Router::new().route("/panic", campfire_kit::get(panicking)).route("/rooms/{id}", campfire_kit::get(show));
+    let app = campfire_kit::app(router, kit_with(config));
+    let reply = send(&app, get("/panic").body(AxumBody::empty()).unwrap()).await;
+    assert_eq!(reply.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(reply.text(), "<h1>Internal error</h1>");
+    assert!(reply.header("x-request-id").is_some());
+    let next = send(&app, get("/rooms/1").body(AxumBody::empty()).unwrap()).await;
+    assert_eq!(next.status, StatusCode::OK);
+}
+
+#[tokio::test]
 async fn renders_html_with_rails_headers() {
     let reply = send(&app(), get("/rooms/5").body(AxumBody::empty()).unwrap()).await;
     assert_eq!(reply.status, StatusCode::OK);

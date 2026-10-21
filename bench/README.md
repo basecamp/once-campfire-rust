@@ -16,3 +16,8 @@ in `parity/`.
 `bench/run` retains the detailed Rails/Rust HTTP, Action Cable and upload comparison,
 using the shared validated client. Its default results directory is ignored `tmp/bench`.
 Historical results preserve the commands and evidence used at the time.
+
+The [cold/mixed workload validation](../plans/cached-response-pr-validation.md)
+documents `bench/cached-workloads` and `bench/cached-workloads-report`, including
+two distinct authenticated readers, independently audited writes, achieved write
+rates, writer latency and the high-write overload limitation.

@@ -121,8 +121,10 @@ behavior changes and compatibility limits are listed below.
   base URL, preventing a request's Host from changing other users' links. Authenticated room,
   messages, sidebar and search responses also retain their completed identity/gzip representation
   for up to 15 seconds in a bounded 64 MiB store (`CAMPFIRE_RESPONSE_CACHE_MB=0` disables it).
-  Authentication and permissions are checked on every request; any SQLite commit, including
-  another process's writes, invalidates previous responses. Cookies, flash, request variants,
+  Identical authenticated GETs reuse the completed pipeline's authority only within the same
+  observed database generation, signed-cookie validity and hourly activity window. Every hit
+  observes SQLite; any commit, including another process's writes, invalidates previous responses.
+  Encrypted session data, bodies, HEAD and validators use the ordinary pipeline. Cookies, flash, request variants,
   conditional requests and HEAD retain their normal behavior. Message fragments share the
   existing 32 MiB budget across origins and database generations, so direct SQL edits remain visible even
   without timestamp updates. Message ETags include rendered dependencies; messages omit

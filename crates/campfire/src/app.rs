@@ -189,11 +189,12 @@ fn router(app: &App, kit: Kit) -> Router {
         .merge(app.cable.router::<Kit>(campfire_cable::protocol::DEFAULT_MOUNT_PATH))
         .route("/", dispatch())
         .route("/{*path}", dispatch())
-        .layer(axum::middleware::from_fn(public_files));
+        .layer(axum::middleware::from_fn(public_files))
+        .layer(axum::middleware::from_fn_with_state(app.clone(), crate::response_cache::early));
     // config.ru: `use Rack::Deflater` around the whole app.
     campfire_kit::app(routes, kit)
         .layer(axum::middleware::from_fn(campfire_kit::deflater::deflater))
-        .layer(axum::middleware::from_fn(crate::response_cache::completed))
+        .layer(axum::middleware::from_fn_with_state(app.clone(), crate::response_cache::completed))
 }
 
 /// The Rails route table, with the app's fragment cache current while the action runs.

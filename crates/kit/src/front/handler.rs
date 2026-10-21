@@ -110,7 +110,7 @@ impl Handler {
         let (status, mut headers) = (response.status(), response.headers().clone());
         headers.remove("x-cache");
         let (cache, variant) = (self.cache.clone(), variant.variant_headers());
-        let store = move |body: Bytes| cache.set(key, CachedResponse { status, headers, body, variant }, now + lifetime, now);
+        let store = move |body: Bytes| cache.set(key, CachedResponse { status, headers, body, variant, metadata: () }, now + lifetime, now);
         if head || hyper::body::Body::is_end_stream(response.body()) {
             // A HEAD response has no body to record (the connection never reads one), and neither
             // has an empty one (it's never polled).

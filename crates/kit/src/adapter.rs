@@ -129,7 +129,7 @@ where
     let result = match failure {
         Some(error) => Err(error),
         None => {
-            let future: Pin<Box<dyn Future<Output = Result<Response>> + Send + '_>> = Box::pin(action.call(&mut ctx));
+            let future = action.call(&mut ctx);
             // A panicking action is an exception like any other: Rails' `ShowExceptions` answers
             // 500 with `public/500.html`, where an unwinding handler would drop the connection.
             std::panic::AssertUnwindSafe(future).catch_unwind().await.unwrap_or_else(|panic| Err(panic_error(panic)))

@@ -1,0 +1,205 @@
+#!/usr/bin/env python3
+"""Validate response-cache cold variants and two-user reads with paced, audited writes.
+
+Requires the shared once-campfire-verification client and contracts. Raw output,
+including fixture credentials, belongs in ignored tmp/bench/. See the PR report.
+"""
+import argparse
+import hashlib
+import html
+import json
+import os
+from pathlib import Path
+import resource
+import shutil
+import sqlite3
+import subprocess
+import sys
+import time
+from statistics import median
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+import benchlib as b
+
+p = argparse.ArgumentParser(description=__doc__)
+p.add_argument("--target", action="append", required=True, help="LABEL=normal-release-executable")
+p.add_argument("--out", required=True)
+p.add_argument("--reps", type=int, default=2)
+p.add_argument("--secs", type=int, default=20)
+p.add_argument("--warmup", type=int, default=5)
+p.add_argument("--concurrency", type=int, default=16, help="total read connections, split evenly across users")
+p.add_argument("--users", default="david,jason", help="distinct seeded users with access to both benchmark rooms")
+p.add_argument("--routes", default="room_show,sidebar")
+p.add_argument("--rates", default="0,10,100", help="paced write-rate limits per second; report achieved rates too")
+p.add_argument("--cold", type=int, default=32, help="unique response-cache keys per route, fragments already warm")
+a = p.parse_args()
+targets = {label: str(Path(binary).resolve()) for label, binary in (v.split("=", 1) for v in a.target)}
+names = a.users.split(",")
+routes = a.routes.split(",")
+rates = list(map(int, a.rates.split(",")))
+assert len(names) >= 2 and len(set(names)) == len(names)
+assert a.concurrency > 0 and a.concurrency % len(names) == 0
+assert all(rate == 0 or 1 <= rate <= 100 for rate in rates)
+assert a.cold > 0 and a.reps > 0 and a.secs > 0 and a.warmup > 0
+out = Path(a.out).resolve()
+out.mkdir(parents=True, exist_ok=False)
+seed = out / "seed"
+labels = b.snapshot_seed(str(seed))
+metadata = vars(a) | {
+    "targets": targets, "server_cpus": b.SERVER_CPUS, "loadgen_cpus": b.LOADGEN_CPUS,
+    "cpu_max": Path("/sys/fs/cgroup/cpu.max").read_text().strip(),
+    "source_commit": subprocess.check_output(["git", "-C", b.ROOT, "rev-parse", "HEAD"], text=True).strip(),
+    "verification_revision": subprocess.check_output(["git", "-C", b.VERIFICATION_ROOT, "rev-parse", "HEAD"], text=True).strip(),
+    "binary_sha256": {k: hashlib.file_digest(open(v, "rb"), "sha256").hexdigest() for k, v in targets.items()},
+    "seed_sha256": hashlib.file_digest((seed / "db/production.sqlite3").open("rb"), "sha256").hexdigest(),
+}
+(out / "metadata.json").write_text(json.dumps(metadata, indent=2))
+
+
+def validate(row, status="200"):
+    assert row["validation"] == "route-contract-v1" and row["gzip"]
+    assert row["ok"] == row["latency"]["n"] > 0
+    assert row["errors"] == row["invalid_responses"] == 0
+    assert row["statuses"] == {status: row["ok"]}
+
+
+def prepare(app, directory):
+    directory.mkdir(parents=True)
+    database = str(Path(b.WORK) / "storage/db/production.sqlite3")
+    people = []
+    with sqlite3.connect(database) as db:
+        for name in names:
+            email = labels[f"emails.{name}"]
+            user = db.execute("SELECT id FROM users WHERE email_address=?", (email,)).fetchone()[0]
+            rooms = {row[0] for row in db.execute("SELECT room_id FROM memberships WHERE user_id=?", (user,))}
+            assert {labels["rooms.watercooler"], labels["rooms.hq"]} <= rooms
+            cookie = b.lg("login", "--base", app.base, "--email", email, "--password", labels["passwords.all"])[0]["cookie"]
+            scraped = b.lg("scrape", "--base", app.base, "--cookie", cookie, "--room", labels["rooms.watercooler"])[0]
+            # The shared contract builder names its current fixture email 'emails.david'.
+            # Override that input for each independently verified user; SQL expectations stay
+            # specific to their actual memberships and searches, with the validator unchanged.
+            per_user_labels = directory / f"{name}-labels.json"
+            per_user_labels.write_text(json.dumps(labels | {"emails.david": email}))
+            result = subprocess.run([
+                os.environ.get("RUBY", "ruby"), str(Path(b.VERIFICATION_ROOT) / "bench/contracts.rb"),
+                app.base, cookie, database, str(per_user_labels), scraped["css"], str(directory / name),
+            ], capture_output=True, text=True)
+            assert result.returncode == 0, result.stderr[-2000:]
+            contracts = json.loads(result.stdout)["contracts"]
+            people.append({"user_id": user, "cookie": cookie, "csrf": scraped["csrf"] or "", "contracts": contracts})
+    assert len({person["user_id"] for person in people}) == len(people)
+    return people
+
+
+def arguments(app, person, route, conc, secs):
+    session = {"room": labels["rooms.watercooler"], "write_room": labels["rooms.hq"], "before": labels["messages.busy_060"], "csrf": person["csrf"]}
+    return ["taskset", "-c", b.LOADGEN_CPUS, b.LOADGEN, "http", "--base", app.base,
+            "--cookie", person["cookie"], *map(str, b.routes(session)[route]), "--conc", str(conc),
+            "--duration", str(secs), "--validate", person["contracts"][route]]
+
+
+def audit_writes(path, expected, writer):
+    entries = [json.loads(line) for line in path.read_text().splitlines()]
+    assert len(entries) == expected
+    assert len({row["id"] for row in entries}) == len(entries)
+    assert len({row["token"] for row in entries}) == len(entries)
+    database = Path(b.WORK) / "storage/db/production.sqlite3"
+    with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as db:
+        for entry in entries:
+            row = db.execute("""SELECT m.room_id, m.creator_id, r.body FROM messages m
+                JOIN action_text_rich_texts r ON r.record_type='Message' AND r.record_id=m.id AND r.name='body'
+                WHERE m.id=?""", (entry["id"],)).fetchone()
+            assert row and row[:2] == (labels["rooms.hq"], writer["user_id"])
+            assert html.unescape(row[2]).count(entry["token"]) == 1
+        # Retain a transactionally consistent SQLite snapshot beside the receipt so the
+        # persisted message IDs, creators, rooms and body tokens can be rechecked afterward.
+        with sqlite3.connect(path.with_suffix(".sqlite3")) as snapshot:
+            db.backup(snapshot)
+    return len(entries)
+
+
+def window(app, people, route, rate, secs, audit):
+    processes = []
+    cpu0, usage0, started = app.cpu(), resource.getrusage(resource.RUSAGE_CHILDREN), time.monotonic()
+    try:
+        for index, person in enumerate(people):
+            cmd = arguments(app, person, route, a.concurrency // len(people), secs)
+            if index == 0 and rate:
+                cmd += ["--mixed-write-rate", str(rate), "--mixed-write-room", str(labels["rooms.hq"]),
+                        "--mixed-write-validate", person["contracts"]["post_message"], "--mixed-write-audit", str(audit),
+                        "--csrf", person["csrf"]]
+            processes.append(subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
+        rows = []
+        for process in processes:
+            output, errors = process.communicate(timeout=secs + 60)
+            assert process.returncode == 0, errors[-2000:]
+            row = json.loads(output)
+            validate(row)
+            rows.append(row)
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+            process.wait()
+    elapsed, cpu1, usage1 = time.monotonic() - started, app.cpu(), resource.getrusage(resource.RUSAGE_CHILDREN)
+    generator_cpu = (usage1.ru_utime + usage1.ru_stime) - (usage0.ru_utime + usage0.ru_stime)
+    generator_cpus = int(subprocess.check_output(["taskset", "-c", b.LOADGEN_CPUS, "nproc"], text=True))
+    utilization = generator_cpu / elapsed / generator_cpus
+    assert utilization < .85, "generator-limited sample"
+    reads = sum(row["ok"] for row in rows)
+    writer = rows[0].get("writer")
+    durable = 0
+    if rate:
+        assert writer is not None
+        validate(writer)
+        durable = audit_writes(audit, writer["ok"], people[0])
+    return {"route": route, "rate_limit": rate, "readers": rows, "elapsed_seconds": elapsed,
+            "read_rps": reads / elapsed, "server_cpu_us_per_read_including_writes": (cpu1["campfire"] - cpu0["campfire"]) * 1e6 / reads,
+            "generator_utilization": utilization, "distinct_users": len(people), "read_connections": a.concurrency,
+            "durable_writes": durable, "achieved_write_rps": durable / elapsed}
+
+
+def cold(app, person):
+    result = []
+    for route in ["room_show", "messages_page", "sidebar", "search"]:
+        cpu0, samples = app.cpu(), []
+        for n in range(a.cold):
+            cmd = arguments(app, person, route, 1, 60)
+            index = cmd.index("--path") + 1
+            cmd[index] += ("&" if "?" in cmd[index] else "?") + f"cold_variant={n}"
+            reply = subprocess.run([*cmd, "--requests", "1"], capture_output=True, text=True, timeout=65)
+            assert reply.returncode == 0, reply.stderr[-2000:]
+            row = json.loads(reply.stdout)
+            validate(row)
+            assert row["ok"] == 1
+            samples.append(row["latency"]["p50_ms"])
+        cpu1 = app.cpu()
+        result.append({"route": route, "requests": a.cold, "median_ms": median(samples), "latency_ms": samples,
+                       "server_cpu_us_per_request": (cpu1["campfire"] - cpu0["campfire"]) * 1e6 / a.cold})
+    return result
+
+
+for rep in range(1, a.reps + 1):
+    order = list(targets) if rep % 2 else list(reversed(targets))
+    for route in routes:
+        for rate in rates:
+            for label in order:
+                case = out / f"{label}-{rep}-{route}-{rate}"
+                os.environ["NATIVE_PR_BIN"] = targets[label]
+                app = b.start("native-pr", str(seed), {"LD_LIBRARY_PATH": os.environ.get("LD_LIBRARY_PATH", ""),
+                              "TOKIO_WORKER_THREADS": "2", "CAMPFIRE_LOG": "error"})
+                result = {"label": label, "rep": rep, "failed": True}
+                try:
+                    people = prepare(app, case)
+                    result["user_ids"] = [person["user_id"] for person in people]
+                    if route == routes[0] and rate == rates[0]:
+                        result["cold_response_keys"] = cold(app, people[0])
+                    window(app, people, route, 0, a.warmup, case / "warmup-writes.jsonl")
+                    result.update(window(app, people, route, rate, a.secs, case / "writes.jsonl"))
+                    result["failed"] = False
+                    b.log(label, rep, route, rate, round(result["read_rps"]), "reads/s", round(result["achieved_write_rps"], 2), "durable writes/s")
+                finally:
+                    app.stop()
+                    case.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(Path(b.WORK) / "app.log", case / "app.log")
+                    (case / "result.json").write_text(json.dumps(result, indent=2))

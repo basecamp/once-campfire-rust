@@ -31,50 +31,52 @@ const ENTRY_OVERHEAD: usize = 256;
 
 /// A response as the cache keeps it (`CacheableResponse`).
 #[derive(Debug)]
-pub struct CachedResponse {
+pub struct CachedResponse<M = ()> {
     pub status: StatusCode,
     pub headers: HeaderMap,
     pub body: Bytes,
     /// The request's values of the headers the response `Vary`s on, when it was stored.
     pub variant: Vec<(String, String)>,
+    /// Fixed-size application admission metadata, charged to the same cache budget.
+    pub metadata: M,
 }
 
-impl CachedResponse {
+impl<M> CachedResponse<M> {
     /// How much of the cache it takes up stored under `key`.
     fn size(&self, key: &str) -> usize {
         let headers: usize = self.headers.iter().map(|(n, v)| n.as_str().len() + v.len()).sum();
         let variant: usize = self.variant.iter().map(|(n, v)| n.len() + v.len()).sum();
-        self.body.len() + headers + variant + key.len() + ENTRY_OVERHEAD
+        self.body.len() + headers + variant + key.len() + ENTRY_OVERHEAD + std::mem::size_of::<M>()
     }
 }
 
 /// `MemoryCache`: a size-bounded map that evicts by sampling.
-pub struct MemoryCache {
-    inner: Mutex<Inner>,
+pub struct MemoryCache<M = ()> {
+    inner: Mutex<Inner<M>>,
 }
 
-struct Inner {
+struct Inner<M> {
     capacity: i64,
     max_item_size: i64,
     size: i64,
     /// The keys again, for sampling; each shares its string with the map.
     keys: Vec<Arc<str>>,
-    items: HashMap<Arc<str>, Entry>,
+    items: HashMap<Arc<str>, Entry<M>>,
 }
 
-struct Entry {
+struct Entry<M> {
     last_accessed_at: Instant,
     expires_at: Instant,
-    value: Arc<CachedResponse>,
+    value: Arc<CachedResponse<M>>,
     size: i64,
 }
 
-impl MemoryCache {
+impl<M> MemoryCache<M> {
     pub fn new(capacity: i64, max_item_size: i64) -> Self {
         Self { inner: Mutex::new(Inner { capacity, max_item_size, size: 0, keys: Vec::new(), items: HashMap::new() }) }
     }
 
-    pub fn get(&self, key: &str, now: Instant) -> Option<Arc<CachedResponse>> {
+    pub fn get(&self, key: &str, now: Instant) -> Option<Arc<CachedResponse<M>>> {
         let mut inner = self.inner.lock().unwrap();
         let item = inner.items.get_mut(key)?;
         if item.expires_at < now {
@@ -84,7 +86,7 @@ impl MemoryCache {
         Some(item.value.clone())
     }
 
-    pub fn set(&self, key: String, value: CachedResponse, expires_at: Instant, now: Instant) {
+    pub fn set(&self, key: String, value: CachedResponse<M>, expires_at: Instant, now: Instant) {
         let mut inner = self.inner.lock().unwrap();
         let item_size = value.size(&key) as i64;
         if item_size > inner.max_item_size || item_size > inner.capacity {
@@ -110,7 +112,7 @@ impl MemoryCache {
     }
 }
 
-impl Inner {
+impl<M> Inner<M> {
     /// Samples 5 random items and evicts the least recently used, or the first expired one found.
     fn evict_oldest_item(&mut self, now: Instant) {
         let mut rng = rand::rng();
@@ -253,7 +255,13 @@ mod tests {
     use super::*;
 
     fn response(body: &str) -> CachedResponse {
-        CachedResponse { status: StatusCode::OK, headers: HeaderMap::new(), body: Bytes::from(body.to_string()), variant: Vec::new() }
+        CachedResponse {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+            body: Bytes::from(body.to_string()),
+            variant: Vec::new(),
+            metadata: (),
+        }
     }
 
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
@@ -368,6 +376,25 @@ mod tests {
         let inner = cache.inner.lock().unwrap();
         let held: usize = inner.keys.iter().map(|k| k.len() + ENTRY_OVERHEAD).sum();
         assert!(held as i64 <= capacity);
+    }
+
+    #[test]
+    fn memory_cache_charges_application_metadata() {
+        let now = Instant::now();
+        let cache = MemoryCache::new(ENTRY_OVERHEAD as i64 + 100, 4096);
+        cache.set(
+            "key".into(),
+            CachedResponse {
+                status: StatusCode::OK,
+                headers: HeaderMap::new(),
+                body: Bytes::new(),
+                variant: Vec::new(),
+                metadata: [0u8; 512],
+            },
+            now + Duration::from_secs(15),
+            now,
+        );
+        assert!(cache.get("key", now).is_none(), "metadata cannot evade the memory budget");
     }
 
     #[test]

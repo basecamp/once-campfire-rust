@@ -1,0 +1,64 @@
+#!/usr/bin/env python3
+"""Report complete, validated Rust cold/mixed workload receipts."""
+import argparse
+import json
+from pathlib import Path
+from statistics import median
+
+p = argparse.ArgumentParser(description=__doc__)
+p.add_argument("directory")
+a = p.parse_args()
+root = Path(a.directory)
+m = json.loads((root / "metadata.json").read_text())
+assert set(m["targets"]) == {"preparation", "early"}
+routes = m["routes"].split(",")
+rates = list(map(int, m["rates"].split(",")))
+rows, cold = {}, {}
+for label in m["targets"]:
+    for rep in range(1, m["reps"] + 1):
+        for route in routes:
+            for rate in rates:
+                r = json.loads((root / f"{label}-{rep}-{route}-{rate}/result.json").read_text())
+                assert not r["failed"] and (r["label"], r["rep"], r["route"], r["rate_limit"]) == (label, rep, route, rate)
+                assert r["distinct_users"] == len(set(r["user_ids"])) == len(m["users"].split(","))
+                assert len(r["readers"]) == r["distinct_users"]
+                assert r["read_connections"] == m["concurrency"] and r["generator_utilization"] < .85
+                for reader in r["readers"]:
+                    for request in [reader] + ([reader["writer"]] if "writer" in reader else []):
+                        assert request["validation"] == "route-contract-v1" and request["gzip"]
+                        assert request["ok"] == request["latency"]["n"] > 0
+                        assert request["errors"] == request["invalid_responses"] == 0
+                        assert request["statuses"] == {"200": request["ok"]}
+                assert r["durable_writes"] == (r["readers"][0]["writer"]["ok"] if rate else 0)
+                rows.setdefault((label, route, rate), []).append(r)
+                for c in r.get("cold_response_keys", []):
+                    assert c["requests"] == len(c["latency_ms"]) == m["cold"]
+                    cold.setdefault((label, c["route"]), []).extend(c["latency_ms"])
+
+print(f"{m['reps']} alternating repetitions, {m['concurrency']} read connections, {m['users']}; all requests validated and writes audited.\n")
+print("| Route | Write-rate limit/s | Read req/s preparation → early | Ratio | Achieved write/s preparation / early | Writer p99 ms preparation / early | Achieved write rates |")
+print("|---|---:|---:|---:|---:|---:|---|")
+for route in routes:
+    for rate in rates:
+        before, after = (median(r["read_rps"] for r in rows[label, route, rate]) for label in ("preparation", "early"))
+        wb, wa = (median(r["achieved_write_rps"] for r in rows[label, route, rate]) for label in ("preparation", "early"))
+        wp = "—"
+        matched = "no writes"
+        if rate:
+            pb, pa = (median(r["readers"][0]["writer"]["latency"]["p99_ms"] for r in rows[label, route, rate]) for label in ("preparation", "early"))
+            wp = f"{pb:.2f} / {pa:.2f}"
+            paired = zip(rows["preparation", route, rate], rows["early", route, rate])
+            similar = all(min(x["achieved_write_rps"], y["achieved_write_rps"]) /
+                          max(x["achieved_write_rps"], y["achieved_write_rps"]) >= .95 for x, y in paired)
+            matched = "within 5% each repetition" if similar else "unequal"
+        print(f"| {route} | {rate} | {before:,.0f} → {after:,.0f} | {after / before:.2f}× | {wb:.2f} / {wa:.2f} | {wp} | {matched} |")
+print("\nRates are caps, not guaranteed arrivals. Rows with unequal achieved write rates describe overload behavior and do not establish matched-write-load read speedups.\n")
+print("\nCold response-cache variants, fragments already warm, one fresh HTTP connection/request.\n")
+print("| Route | Requests/target | Median latency ms preparation → early |")
+print("|---|---:|---:|")
+for route in ["room_show", "messages_page", "sidebar", "search"]:
+    before, after = (cold[label, route] for label in ("preparation", "early"))
+    assert len(before) == len(after) == m["reps"] * m["cold"]
+    print(f"| {route} | {len(before)} | {median(before):.3f} → {median(after):.3f} |")
+all_rows = [r for group in rows.values() for r in group]
+print(f"\nValidated timed reads: {sum(reader['ok'] for r in all_rows for reader in r['readers']):,}; audited durable writes: {sum(r['durable_writes'] for r in all_rows):,}; peak generator utilization: {max(r['generator_utilization'] for r in all_rows):.3f}.")

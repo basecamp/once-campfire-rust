@@ -455,10 +455,19 @@ pub fn platform(c: &Ctx) -> Cow<'_, platform::ApplicationPlatform> {
 ///
 /// Only when it changes: Rails sets it on every room page.
 pub fn remember_last_room_visited(c: &mut Ctx, room_id: i64) {
-    let room_id = room_id.to_string();
-    if c.cookies.get("last_room") != Some(room_id.as_str()) {
-        c.cookies.set("last_room", Cookie::new(room_id).permanent());
+    if c.cookies.get("last_room") != Some(room_id.to_string().as_str()) {
+        c.cookies.set("last_room", last_room_preference_cookie(room_id, c.now()));
+        c.set_current(LastRoomPreference(room_id));
     }
+}
+
+/// The actual preference side effect, recorded only when the controller writes the cookie.
+#[derive(Clone, Copy)]
+pub struct LastRoomPreference(pub i64);
+
+/// Shared by normal visits and admitted early hits, keeping the cookie policy in one place.
+pub fn last_room_preference_cookie(room_id: i64, now: jiff::Timestamp) -> Cookie {
+    Cookie::new(room_id.to_string()).expires(campfire_kit::clock::years_from(now, 20))
 }
 
 /// `last_room_visited`: the `last_room` cookie's room if the user is in it, else
