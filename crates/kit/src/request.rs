@@ -1,6 +1,7 @@
 //! The request as a Rails controller sees it: method after `_method` override, URL pieces with
 //! proxy-derived host and protocol, `remote_ip`, and the raw body.
 
+use std::fmt::Write;
 use std::net::IpAddr;
 
 use axum::body::Bytes;
@@ -189,8 +190,19 @@ impl Request {
 
     /// `request.host_with_port`: the port only when it isn't the scheme's default.
     pub fn host_with_port(&self) -> String {
-        let port = self.port();
-        if port == self.standard_port() { self.host() } else { format!("{}:{port}", self.host()) }
+        let mut authority = self.raw_host_with_port();
+        let Some((host, port)) = authority.rsplit_once(':') else { return authority };
+        if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+            return authority;
+        }
+        let port = port.parse::<u16>().unwrap_or(self.standard_port());
+        let host_len = host.len();
+        authority.truncate(host_len);
+        if port != self.standard_port() {
+            // A canonical decimal port never needs more space than the original digits.
+            write!(authority, ":{port}").unwrap();
+        }
+        authority
     }
 
     /// `request.base_url`, e.g. `https://campfire.example.com`.
@@ -393,6 +405,32 @@ mod tests {
         let assume = ProxyConfig { assume_ssl: true, ..ProxyConfig::default() };
         let r = request(&[("host", "chat.example.com")], "127.0.0.1", &assume);
         assert_eq!(r.base_url(), "https://chat.example.com");
+    }
+
+    #[test]
+    fn host_with_port_preserves_authority_normalization() {
+        for (authority, http, https) in [
+            ("chat.example", "chat.example", "chat.example"),
+            ("chat.example:80", "chat.example", "chat.example:80"),
+            ("chat.example:443", "chat.example:443", "chat.example"),
+            ("chat.example:00081", "chat.example:81", "chat.example:81"),
+            ("chat.example:65536", "chat.example", "chat.example"),
+            ("chat.example:99999999999999999999", "chat.example", "chat.example"),
+            ("chat.example:", "chat.example:", "chat.example:"),
+            ("chat.example:abc", "chat.example:abc", "chat.example:abc"),
+            ("[2001:db8::1]", "[2001:db8::1]", "[2001:db8::1]"),
+            ("[2001:db8::1]:00443", "[2001:db8::1]:443", "[2001:db8::1]"),
+            ("[2001:db8::1]:3000", "[2001:db8::1]:3000", "[2001:db8::1]:3000"),
+        ] {
+            for (assume_ssl, expected) in [(false, http), (true, https)] {
+                let proxy = ProxyConfig { assume_ssl, ..ProxyConfig::default() };
+                let direct = request(&[("host", authority)], "127.0.0.1", &proxy);
+                assert_eq!(direct.host_with_port(), expected, "{authority}, ssl={assume_ssl}");
+                let forwarded = format!("ignored.example, {authority}");
+                let proxied = request(&[("host", "internal:3000"), ("x-forwarded-host", &forwarded)], "127.0.0.1", &proxy);
+                assert_eq!(proxied.host_with_port(), expected, "forwarded {authority}, ssl={assume_ssl}");
+            }
+        }
     }
 
     #[test]

@@ -35,6 +35,29 @@ fn committed_external_writes_invalidate_without_timestamp_changes() {
 }
 
 #[test]
+fn retained_observer_statement_resets_and_observes_later_commits() {
+    let (_dir, writer, cache) = store(1024);
+    let first = cache.version().unwrap();
+    for _ in 0..32 {
+        assert_eq!(cache.version(), Some(first));
+    }
+    writer.execute_batch("ALTER TABLE records ADD COLUMN extra TEXT; UPDATE records SET value = 'after';").unwrap();
+    let second = cache.version().unwrap();
+    assert_ne!(second, first);
+    for _ in 0..32 {
+        assert_eq!(cache.version(), Some(second));
+    }
+    // An unreset observer would retain its read transaction and block this checkpoint.
+    let busy: i64 = writer.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0)).unwrap();
+    assert_eq!(busy, 0);
+    let checkpointed = cache.version().unwrap();
+    writer.execute_batch("BEGIN; UPDATE records SET value = 'rolled back'; ROLLBACK;").unwrap();
+    assert_eq!(cache.version(), Some(checkpointed));
+    writer.execute("UPDATE records SET value = 'committed again'", []).unwrap();
+    assert_ne!(cache.version(), Some(checkpointed));
+}
+
+#[test]
 fn commit_during_render_cannot_admit_old_authorization_or_content() {
     let (_dir, writer, cache) = store(1024);
     let before_authentication = ticket(&cache, "sidebar");

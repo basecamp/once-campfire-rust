@@ -44,7 +44,9 @@ struct Observer {
 
 impl Observer {
     fn version(&mut self) -> rusqlite::Result<u64> {
-        let current = self.db.query_row("PRAGMA data_version", [], |row| row.get(0))?;
+        // Retain the statement, not its result: each capture/lookup/admission still observes
+        // SQLite under the same mutex, including commits from other processes.
+        let current = self.db.prepare_cached("PRAGMA data_version")?.query_row([], |row| row.get(0))?;
         if current != self.data_version {
             self.generation += 1;
             self.data_version = current;
@@ -261,10 +263,10 @@ fn request_key(c: &Ctx, round: &Round, user: i64, session: i64) -> Option<String
             continue;
         }
         field(name.as_str().as_bytes());
+        field(&(c.request.headers.get_all(name).iter().count() as u64).to_le_bytes());
         for value in c.request.headers.get_all(name) {
             field(value.as_bytes());
         }
-        field(b"");
     }
     if length > MAX_KEY_INPUT {
         return None;

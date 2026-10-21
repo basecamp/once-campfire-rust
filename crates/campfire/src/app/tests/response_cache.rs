@@ -381,3 +381,35 @@ async fn delayed_detached_render_does_not_poison_a_new_generation() {
     assert!(html.contains("new detached render body"), "a delayed old broadcast must not populate the new fragment generation");
     assert!(!html.contains("old detached render body"));
 }
+
+#[tokio::test]
+async fn repeated_header_values_cannot_impersonate_a_frame_header() {
+    let Some((test, cookie, _user, room)) = fixture().await else { return };
+    let path = format!("/rooms/{room}");
+    let embedded = || {
+        let mut request = get_with_cookie(&path, &cookie);
+        for value in ["value", "", "turbo-frame", "room"] {
+            request.headers_mut().append("t", value.parse().unwrap());
+        }
+        request
+    };
+    for _ in 0..4 {
+        let full = send(&test.booted.router, embedded()).await;
+        assert_eq!(full.status, StatusCode::OK);
+        assert!(full.text().contains("<!DOCTYPE html>"));
+    }
+    let frame = || {
+        let mut request = get_with_cookie(&path, &cookie);
+        request.headers_mut().insert("t", "value".parse().unwrap());
+        request.headers_mut().insert("turbo-frame", "room".parse().unwrap());
+        request
+    };
+    let before = hits(&test);
+    let first = send(&test.booted.router, frame()).await;
+    assert_eq!(first.status, StatusCode::OK);
+    assert_eq!(hits(&test), before, "repeated values must not alias a separate header");
+    assert!(!first.text().contains("<!DOCTYPE html>"));
+    let cached = send(&test.booted.router, frame()).await;
+    assert_eq!(hits(&test), before + 1);
+    assert_eq!(cached.body, first.body);
+}
