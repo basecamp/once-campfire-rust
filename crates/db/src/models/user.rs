@@ -440,7 +440,11 @@ impl User {
         let mut seen = Vec::new();
         for ip in ips.into_iter().flatten().filter(|ip| !ip.trim().is_empty()) {
             if !seen.contains(&ip) {
-                Ban::create(tx, self.id, &ip)?;
+                // reference/app/models/user/bannable.rb lets an ineligible session IP abort the
+                // entire ban. Skip its IP ban so the account and sessions can still be revoked.
+                if Ban::validate(&ip).is_empty() {
+                    Ban::create(tx, self.id, &ip)?;
+                }
                 seen.push(ip);
             }
         }

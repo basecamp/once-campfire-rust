@@ -256,13 +256,20 @@ fn ban_creates_bans_from_session_ips_and_removes_sessions() {
 }
 
 #[test]
-fn ban_rejects_private_session_ips() {
+fn ban_skips_ineligible_session_ips_but_revokes_the_user() {
     let t = TestDb::new();
     let kevin = id("kevin");
-    t.write(move |tx| Session::start(tx, kevin, None, Some("192.168.1.1")).map(|_| ()));
+    t.write(move |tx| {
+        for ip in ["192.168.1.1", "not an ip", "8.8.8.8", "127.0.0.1"] {
+            Session::start(tx, kevin, None, Some(ip))?;
+        }
+        Ok(())
+    });
     let mut user = user(&t, "kevin");
-    assert!(t.try_write(move |tx| user.ban(tx)).is_err());
-    assert_eq!(t.read(|c| User::find(c, kevin)).status, Status::Active, "rolled back");
+    t.write(move |tx| user.ban(tx));
+    assert_eq!(t.read(|c| User::find(c, kevin)).status, Status::Banned);
+    assert_eq!(t.read(|c| Session::count_for_user(c, kevin)), 0);
+    assert_eq!(t.read(|c| Ban::for_user(c, kevin)).iter().map(|ban| ban.ip_address.as_str()).collect::<Vec<_>>(), ["8.8.8.8"]);
 }
 
 #[test]

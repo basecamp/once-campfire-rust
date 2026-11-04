@@ -116,6 +116,9 @@ behavior changes and compatibility limits are listed below.
 - **Cookies:** sessions are written only on change and deleted when empty; `last_room` only on
   change. `session_token` is re-signed on the hourly activity refresh, retaining its rolling
   20-year expiry. Other authenticated reads avoid the database writer.
+- **Bans:** when a session records a private, loopback, link-local or malformed address, banning
+  its user skips an IP ban for that address and still revokes the account and sessions. The pinned
+  Rails reference rolls back the whole user ban when the IP ban fails validation.
 - **Caching:** room, messages and search ETags hash cached page parts rather than the body.
   Copy-link buttons cache paths and resolve them against the page URL; bot JSON is cached per
   base URL, preventing a request's Host from changing other users' links. Authenticated room,
