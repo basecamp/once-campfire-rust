@@ -8,10 +8,10 @@
 #
 #   docker build -t campfire-rust --build-arg APP_VERSION=... --build-arg GIT_REVISION=... .
 #
-# Media: variants and video posters must be byte-identical to the reference's, so libvips and
-# ffmpeg are built from the same Debian trixie source packages the reference image ships
-# (libvips 8.16.1-1+deb13u1, ffmpeg 7:7.1.5-0+deb13u1), with the same compiler flags, against the
-# same Debian libraries. What's left out is only what Campfire never reaches:
+# Media: variants and video posters aim to match the reference. libvips and ffmpeg are built from
+# Debian trixie sources with the same compiler flags and libraries. libvips 8.16.1-1+deb13u2 is a
+# security revision newer than the reference's 8.16.1-1+deb13u1; ffmpeg stays at 7:7.1.5-0+deb13u1.
+# What's left out is only what Campfire never reaches:
 #
 #   * libvips: the loaders that Vips.block_untrusted and the variable content types already rule
 #     out (ImageMagick, OpenSlide, PDF, SVG, JPEG XL, JPEG 2000, OpenEXR, FITS, Matlab), and
@@ -28,8 +28,8 @@
 
 ARG RUST_VERSION=1.98.1
 ARG DEBIAN_RELEASE=trixie
-ARG LIBVIPS_VERSION=8.16.1-1+deb13u1
-ARG LIBVIPS_DSC_SHA256=60205e00d061b9d8072938e04899f2ca2fdac0513068e561d33f7c87fae1ae2e
+ARG LIBVIPS_VERSION=8.16.1-1+deb13u2
+ARG LIBVIPS_DSC_SHA256=5e4a1cc2b06e14b42335bfe38931cf9bf1a31db6b262633ba04fcd45637b2a18
 ARG FFMPEG_VERSION=7:7.1.5-0+deb13u1
 ARG FFMPEG_DSC_SHA256=9ed2ed34cbe7f056eeebbe9045c5e2d15e41b5b053fe7c8ba6979a0b6fb081ce
 
