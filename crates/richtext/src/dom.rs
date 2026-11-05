@@ -109,6 +109,11 @@ impl Dom {
         &self.nodes[id]
     }
 
+    /// The number of nodes in the arena, so a caller can size a per-node table.
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
     fn push(&mut self, data: NodeData) -> NodeId {
         self.nodes.push(Node { data, parent: None, children: Vec::new() });
         self.nodes.len() - 1
@@ -240,6 +245,24 @@ impl Dom {
         }
     }
 
+    /// Detaches every node in `ids`, filtering each parent's children once rather than once per
+    /// node: detaching the N children of one parent one at a time scans that list N times.
+    pub fn detach_all(&mut self, ids: &[NodeId]) {
+        let mut gone = vec![false; self.nodes.len()];
+        let mut parents = Vec::new();
+        for &id in ids {
+            if let Some(parent) = self.nodes[id].parent.take() {
+                gone[id] = true;
+                parents.push(parent);
+            }
+        }
+        parents.sort_unstable();
+        parents.dedup();
+        for parent in parents {
+            self.nodes[parent].children.retain(|&c| !gone[c]);
+        }
+    }
+
     pub fn append(&mut self, parent: NodeId, child: NodeId) {
         self.detach(child);
         self.nodes[child].parent = Some(parent);
@@ -252,6 +275,21 @@ impl Dom {
         let index = self.nodes[parent].children.iter().position(|&c| c == reference).unwrap();
         self.nodes[new].parent = Some(parent);
         self.nodes[parent].children.insert(index, new);
+    }
+
+    /// Replaces `id` with its children, in order, at `id`'s own place under its parent: Nokogiri's
+    /// `node.before(node.children); node.remove`. Done as one splice so unwrapping a wide element
+    /// is O(children + siblings), not O(children) insertions that each search and shift the
+    /// parent's child list (which is quadratic in the number of children).
+    pub fn unwrap(&mut self, id: NodeId) {
+        let Some(parent) = self.parent(id) else { return };
+        let children = std::mem::take(&mut self.nodes[id].children);
+        for &child in &children {
+            self.nodes[child].parent = Some(parent);
+        }
+        let index = self.nodes[parent].children.iter().position(|&c| c == id).expect("child of its parent");
+        self.nodes[parent].children.splice(index..=index, children);
+        self.nodes[id].parent = None;
     }
 
     /// The text content of a node, as libxml2's `xmlNodeGetContent` computes it.

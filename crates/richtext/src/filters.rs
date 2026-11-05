@@ -87,9 +87,7 @@ pub fn sanitize_tags(content: Content) -> Content {
     let allowed = sanitize_tags_allowed_tags();
     let disallowed: Vec<_> =
         dom.descendants(root).into_iter().filter(|&n| dom.local_name(n).is_some_and(|name| !allowed.contains(&name))).collect();
-    for node in disallowed {
-        dom.detach(node);
-    }
+    dom.detach_all(&disallowed);
     Content { dom, root }
 }
 

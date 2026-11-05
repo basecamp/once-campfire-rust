@@ -4,7 +4,10 @@
 use std::time::{Duration, Instant};
 
 use campfire_richtext::dom::{Dom, MAX_ATTRIBUTES};
-use campfire_richtext::{AttachableResolver, GidLookup, RenderContext, SignedLookup, editable_value, message_presentation, to_plain_text};
+use campfire_richtext::{
+    AttachableResolver, Content, GidLookup, RenderContext, SignedLookup, editable_value, mentioned_users, message_presentation,
+    to_plain_text,
+};
 
 struct NoRecords;
 
@@ -94,6 +97,49 @@ fn many_bare_domains_autolink_in_linear_time() {
     let html = presentation(&body);
     assert_quick(started, "autolinking 64 KB of bare domains");
     assert_eq!(html.matches("<a target=\"_blank\" href=\"http://www.a.com\">").count(), 64 * 1024 / 16);
+}
+
+#[test]
+fn a_long_ordered_list_converts_to_plain_text_in_linear_time() {
+    // Each item's number was found by scanning its whole list again, on the database writer
+    // thread when a message is indexed for search.
+    let body = format!("<ol>{}</ol>", "<li>x</li>".repeat(64 * 1024));
+    let started = Instant::now();
+    let text = to_plain_text(&body, &ctx()).unwrap();
+    assert_quick(started, "plain text for a 64K item list");
+    assert!(text.ends_with("65536. x"), "{}", &text[text.len() - 20..]);
+}
+
+#[test]
+fn a_wide_disallowed_wrapper_renders_in_linear_time() {
+    // The wrapper's children were moved up one at a time, each move searching and shifting the
+    // parent's children.
+    let body = format!("<font>{}</font>", "<b>x</b>".repeat(64 * 1024));
+    let started = Instant::now();
+    let html = Content::load(&body, &ctx()).unwrap().to_rendered_html_with_layout(&ctx()).unwrap();
+    assert_quick(started, "rendering a <font> around 64K children");
+    assert_eq!(html.matches("<b>x</b>").count(), 64 * 1024);
+}
+
+#[test]
+fn many_sibling_disallowed_tags_are_dropped_in_linear_time() {
+    // Each disallowed tag was detached on its own, each detach filtering the parent's children.
+    let body = "<font>x</font>".repeat(128 * 1024);
+    let started = Instant::now();
+    let html = presentation(&body);
+    assert_quick(started, "dropping 128K sibling <font> tags");
+    assert!(!html.contains("font"), "{html}");
+}
+
+#[test]
+fn gallery_detection_is_linear_in_the_attachments_of_one_element() {
+    // Each gallery attachment copied and searched its parent's children to find the one before it.
+    let body =
+        format!("<div>{}</div>", "<action-text-attachment presentation=\"gallery\"></action-text-attachment><b>x</b>".repeat(32 * 1024));
+    let started = Instant::now();
+    let users = mentioned_users(&body, &ctx()).unwrap();
+    assert_quick(started, "loading 32K gallery attachments");
+    assert!(users.is_empty());
 }
 
 /// Content attachments nested `levels` deep, each saying which level it is.
