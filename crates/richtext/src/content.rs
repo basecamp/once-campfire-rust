@@ -249,19 +249,24 @@ fn is_gallery_attachment(dom: &Dom, node: NodeId) -> bool {
 /// `AttachmentGallery.find_attachment_gallery_nodes`: `div:has(A + A)` for gallery attachments A,
 /// whose children are all gallery attachments or newline/space text.
 pub fn attachment_gallery_nodes(dom: &Dom, root: NodeId) -> Vec<NodeId> {
-    dom.descendants(root)
+    // The gallery attachments whose previous element sibling is one too (`A + A`), from one pass
+    // over each parent's element children rather than a copy and a search per attachment.
+    let nodes = dom.descendants(root);
+    let mut follows_gallery = std::collections::HashSet::new();
+    for &parent in std::iter::once(&root).chain(nodes.iter()) {
+        let mut previous_is_gallery = false;
+        for child in dom.element_children(parent) {
+            let is_gallery = is_gallery_attachment(dom, child);
+            if is_gallery && previous_is_gallery {
+                follows_gallery.insert(child);
+            }
+            previous_is_gallery = is_gallery;
+        }
+    }
+    nodes
         .into_iter()
         .filter(|&div| dom.local_name(div) == Some("div"))
-        .filter(|&div| {
-            dom.descendants(div).into_iter().any(|n| {
-                is_gallery_attachment(dom, n) && {
-                    let parent = dom.parent(n).unwrap();
-                    let siblings = dom.element_children(parent);
-                    let index = siblings.iter().position(|&s| s == n).unwrap();
-                    index > 0 && is_gallery_attachment(dom, siblings[index - 1])
-                }
-            })
-        })
+        .filter(|&div| dom.descendants(div).into_iter().any(|n| follows_gallery.contains(&n)))
         .filter(|&div| {
             dom.children(div).iter().all(|&child| match dom.text(child) {
                 Some(text) => text.chars().all(|c| c == '\n' || c == ' '),

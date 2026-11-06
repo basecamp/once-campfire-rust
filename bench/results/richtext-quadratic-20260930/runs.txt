@@ -1,0 +1,31 @@
+# presentation = message_presentation, body html = Content::load + to_rendered_html_with_layout
+# (Presenter::body_html), plain text = to_plain_text, mentions = mentioned_users. Native release
+# build, fastest of three runs each (timing.rs).
+
+# before: commit d432d9f
+ol 4096 items 40969 bytes: presentation 42.159291ms (Ok(41007)), body html 3.88725ms (Ok(41007)), plain text 32.840333ms (Ok(31660)), mentions 1.622208ms (Ok(0))
+ol 16384 items 163849 bytes: presentation 539.179791ms (Ok(163887)), body html 16.224083ms (Ok(163887)), plain text 502.68575ms (Ok(136349)), mentions 6.944375ms (Ok(0))
+ol 65536 items 655369 bytes: presentation 7.94272925s (Ok(655407)), body html 66.98375ms (Ok(655407)), plain text 7.744706709s (Ok(578717)), mentions 28.069167ms (Ok(0))
+wrapper 16384 items 131085 bytes: presentation 8.208625ms (Ok(38)), body html 107.754375ms (Ok(131110)), plain text 7.469ms (Ok(16384)), mentions 6.161833ms (Ok(0))
+wrapper 65536 items 524301 bytes: presentation 32.685375ms (Ok(38)), body html 1.347930458s (Ok(524326)), plain text 30.995916ms (Ok(65536)), mentions 25.349042ms (Ok(0))
+fonts 32768 items 458752 bytes: presentation 204.5935ms (Ok(38)), body html 644.026542ms (Ok(32806)), plain text 19.695042ms (Ok(32768)), mentions 17.002833ms (Ok(0))
+fonts 131072 items 1835008 bytes: presentation 2.823304167s (Ok(38)), body html 9.332815458s (Ok(131110)), plain text 76.898166ms (Ok(131072)), mentions 66.581542ms (Ok(0))
+gallery 8192 items 655371 bytes: presentation 817.611083ms (Ok(90161)), body html 628.14925ms (Ok(679985)), plain text 308.75775ms (Ok(8192)), mentions 271.685333ms (Ok(0))
+gallery 32768 items 2621451 bytes: presentation 11.224143542s (Ok(360497)), body html 9.596587292s (Ok(2719793)), plain text 4.535602375s (Ok(32768)), mentions 4.309722333s (Ok(0))
+attachments 4096 items 352267 bytes: presentation 139.216209ms (Ok(24625)), body html 77.423709ms (Ok(606257)), plain text 30.558167ms (Ok(4096)), mentions 9.752417ms (Ok(0))
+attachments 16384 items 1409035 bytes: presentation 1.37419725s (Ok(98353)), body html 877.909417ms (Ok(2424881)), plain text 241.120708ms (Ok(16384)), mentions 39.579833ms (Ok(0))
+
+# after: list numbers, gallery predecessors, sibling detaches and wrapper unwraps each done in
+# one pass. `attachments` is not fixed (Dom::replace_with_html per attachment), and body html on
+# `fonts` still unwraps each sibling <font> with its own splice.
+ol 4096 items 40969 bytes: presentation 12.799959ms (Ok(41007)), body html 4.295875ms (Ok(41007)), plain text 2.602375ms (Ok(31660)), mentions 1.68475ms (Ok(0))
+ol 16384 items 163849 bytes: presentation 55.075167ms (Ok(163887)), body html 17.951084ms (Ok(163887)), plain text 11.449584ms (Ok(136349)), mentions 7.752542ms (Ok(0))
+ol 65536 items 655369 bytes: presentation 213.64375ms (Ok(655407)), body html 70.529ms (Ok(655407)), plain text 51.083833ms (Ok(578717)), mentions 34.927666ms (Ok(0))
+wrapper 16384 items 131085 bytes: presentation 10.592417ms (Ok(38)), body html 16.49525ms (Ok(131110)), plain text 10.402208ms (Ok(16384)), mentions 6.439125ms (Ok(0))
+wrapper 65536 items 524301 bytes: presentation 35.936042ms (Ok(38)), body html 59.186208ms (Ok(524326)), plain text 33.140958ms (Ok(65536)), mentions 25.9395ms (Ok(0))
+fonts 32768 items 458752 bytes: presentation 20.878375ms (Ok(38)), body html 213.75025ms (Ok(32806)), plain text 20.607208ms (Ok(32768)), mentions 16.87275ms (Ok(0))
+fonts 131072 items 1835008 bytes: presentation 92.417708ms (Ok(38)), body html 3.004054s (Ok(131110)), plain text 81.431292ms (Ok(131072)), mentions 67.158292ms (Ok(0))
+gallery 8192 items 655371 bytes: presentation 276.899125ms (Ok(90161)), body html 154.528791ms (Ok(679985)), plain text 67.829125ms (Ok(8192)), mentions 21.552833ms (Ok(0))
+gallery 32768 items 2621451 bytes: presentation 3.05097425s (Ok(360497)), body html 1.515616292s (Ok(2719793)), plain text 627.891084ms (Ok(32768)), mentions 75.555458ms (Ok(0))
+attachments 4096 items 352267 bytes: presentation 121.690875ms (Ok(24625)), body html 71.738334ms (Ok(606257)), plain text 25.543125ms (Ok(4096)), mentions 9.581667ms (Ok(0))
+attachments 16384 items 1409035 bytes: presentation 745.359583ms (Ok(98353)), body html 426.090166ms (Ok(2424881)), plain text 229.875541ms (Ok(16384)), mentions 40.128625ms (Ok(0))

@@ -176,12 +176,11 @@ fn scrub(dom: &mut Dom, node: NodeId, list: &SafeList) {
         // Unwrap HTML elements (and comments, which have no children); drop foreign (SVG,
         // MathML) elements together with their contents, since they carry a namespace.
         let foreign = dom.is_element(node) && !dom.is_html_element(node);
-        if !foreign {
-            for child in dom.children(node).to_vec() {
-                dom.insert_before(node, child);
-            }
+        if foreign {
+            dom.detach(node);
+        } else {
+            dom.unwrap(node);
         }
-        dom.detach(node);
         return;
     }
     scrub_attributes(dom, node, list);
@@ -504,6 +503,19 @@ mod tests {
             "<a href=\"a%20b\" name=\"c%20d\" title=\"x y\">t</a>"
         );
         assert_eq!(sanitize("<img src=\"a b\" alt=\"q\">", list).unwrap(), "<img src=\"a%20b\" alt=\"q\">");
+    }
+
+    #[test]
+    fn unwraps_disallowed_wrappers_keeping_children_in_order() {
+        let list = SafeList::defaults();
+        // A disallowed HTML wrapper (`<font>`) is unwrapped: its children stay, in order, in its
+        // place. A foreign wrapper is dropped with its contents (see `scrubs_like_rails`).
+        assert_eq!(sanitize("<p>a<font><b>1</b><i>2</i></font>b</p>", list).unwrap(), "<p>a<b>1</b><i>2</i>b</p>");
+        // A wide wrapper unwraps in one pass, not a move per child (which was quadratic).
+        let wide = format!("<font>{}</font>", "<b>x</b>".repeat(2000));
+        let out = sanitize(&wide, list).unwrap();
+        assert_eq!(out.matches("<b>x</b>").count(), 2000);
+        assert!(!out.contains("font"));
     }
 
     #[test]
