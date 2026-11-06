@@ -17,7 +17,9 @@ fn element_child_ordinals(dom: &Dom) -> Vec<usize> {
     for parent in 0..dom.node_count() {
         let mut index = 0;
         for &child in dom.children(parent) {
-            if dom.is_element(child) {
+            // A fragment root that `parse_nodes` leaves in the arena still lists the nodes it
+            // handed over, so a node is numbered only by its current parent.
+            if dom.parent(child) == Some(parent) && dom.is_element(child) {
                 ordinals[child] = index;
                 index += 1;
             }
@@ -107,5 +109,16 @@ mod tests {
         let text = plain_text(&format!("<ol>{}</ol>", "<li>x</li>".repeat(2000)));
         assert!(text.starts_with("1. x\n2. x\n"));
         assert!(text.ends_with("\n1999. x\n2000. x"));
+    }
+
+    #[test]
+    fn numbers_list_items_spliced_in_from_parsed_markup() {
+        // `replace_with_html` leaves the parsed fragment's root in the arena, still listing the
+        // nodes it handed over, so only a node's current parent may number it.
+        let mut dom = Dom::new();
+        let root = dom.parse_fragment("<ol><li>a</li><span></span><li>c</li></ol>").unwrap();
+        let placeholder = dom.descendants(root).into_iter().find(|&n| dom.name(n) == "span").unwrap();
+        dom.replace_with_html(placeholder, "<li>b</li>").unwrap();
+        assert_eq!(node_to_plain_text(&dom, root), "1. a\n2. b\n3. c");
     }
 }
